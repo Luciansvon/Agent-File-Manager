@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SidebarPipelineProgress — five-stage workflow visualization.
+    Scan → Tag → People → Captions → Done. Filled / active / inactive
+    dots with connecting segments. Gold for filled+active.
+
+    1:1 port of macOS SidebarPipelineProgress.swift: 5 EQUAL columns,
+    each containing a dot centered above its label + left/right
+    connector halves. Dots and labels are in the same column structure
+    so they always align vertically. Connectors live in the SAME column
+    as the dot (left half + right half) so they meet adjacent dots
+    without offsetting them.
+-->
+<UserControl
+    x:Class="FileID.Views.Sidebar.SidebarPipelineProgress"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <StackPanel Spacing="8">
+        <TextBlock Text="PIPELINE"
+                   Style="{StaticResource CaptionTextBlockStyle}"
+                   FontWeight="SemiBold"
+                   CharacterSpacing="40"
+                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                   AutomationProperties.HeadingLevel="Level2" />
+
+        <!-- 5 equal columns. Each column owns one stage: dot + label
+             stacked vertically, connector halves in the same column. -->
+        <Grid x:Name="StagesRow" Padding="4,0" />
+    </StackPanel>
+</UserControl>

@@ -1,0 +1,2131 @@
+// DBWriter — drains the Tagging → DB channel and writes 100-file or
+// 200ms batches into the single SQLite writer connection.
+//
+// Single-writer is by design: WAL permits concurrent readers but only
+// one writer. Every insert + the resume cursor update land in the same
+// transaction so a crash mid-batch leaves no partial state. The
+// ocr_fts/doc_fts external-content indexes are maintained by the v15
+// sync triggers — never written here directly.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use rusqlite::{params, Connection, OptionalExtension};
+use tokio::sync::mpsc;
+
+use crate::coordinator::ScanCoordinator;
+use crate::pipeline::semantic_content::{self, PreparedSemanticContent};
+use crate::pipeline::tagging::TaggedFile;
+use crate::platform::{dbwriter_batch_size_for, memory_tier};
+
+/// Fallback flush trigger if the adaptive sizing yields nothing.
+/// `current_batch_size()` polls memory tier and picks a tier-appropriate
+/// value (Low=64, Balanced=250, High=500). 250 is the Balanced default;
+/// previous behavior was 100/200ms.
+const BATCH_SIZE_FALLBACK: usize = 250;
+const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+
+enum SemanticBatchUpdate {
+    Skip,
+    Clear,
+    Replace {
+        content: PreparedSemanticContent,
+        shadow_ready: bool,
+    },
+}
+
+/// Adaptive batch size driven by available RAM. Re-evaluated at the top
+/// of each batch so a memory-pressure shift mid-scan downshifts batch
+/// size before we OOM (rather than tripping the OS-level reaper).
+fn current_batch_size() -> usize {
+    dbwriter_batch_size_for(memory_tier()).max(1)
+}
+
+/// Stats reported per batch — fed into the `batchSummary` IPC event so
+/// the app sidebar can show throughput in real time.
+#[derive(Debug, Clone, Default)]
+pub struct BatchStats {
+    pub batch_index: u32,
+    pub files_in_batch: u32,
+    pub processed_total: u64,
+    /// Cumulative failed-file count. Plumbed through Progress events so
+    /// the sidebar "Failures" stat updates during scan instead of waiting
+    /// for ScanComplete.
+    pub failed_total: u64,
+    pub wall_seconds: f64,
+    pub files_per_second: f64,
+    pub utilization: f64,
+    pub vision_p50_ms: f64,
+    pub vision_p95_ms: f64,
+    pub clip_p50_ms: f64,
+    pub clip_p95_ms: f64,
+    pub store_insert_p50_ms: f64,
+    pub store_insert_p95_ms: f64,
+}
+
+pub struct DbWriter {
+    conn: Arc<Mutex<Connection>>,
+    coordinator: ScanCoordinator,
+}
+
+impl DbWriter {
+    pub fn new(conn: Arc<Mutex<Connection>>, coordinator: ScanCoordinator) -> Self {
+        Self { conn, coordinator }
+    }
+
+    /// Drain the input receiver until the channel closes, flushing on
+    /// the lesser of `BATCH_SIZE` accumulated rows or `FLUSH_INTERVAL`
+    /// since the first row in the current batch.
+    ///
+    /// Returns total processed + total failed counts when finished.
+    pub async fn run<F>(self, mut input: mpsc::Receiver<TaggedFile>, mut on_batch: F)
+        -> Result<(u64, u64)>
+    where
+        F: FnMut(BatchStats),
+    {
+        let mut buffer: Vec<TaggedFile> = Vec::with_capacity(BATCH_SIZE_FALLBACK);
+        let mut deadline: Option<Instant> = None;
+        let mut total: u64 = 0;
+        let mut failed: u64 = 0;
+        let mut batch_index: u32 = 0;
+        let mut current_target = current_batch_size();
+        // Re-check memory tier every 30s so a pressure shift mid-scan
+        // downshifts batch size before we trip the OOM reaper.
+        let mut next_tier_check = Instant::now() + Duration::from_secs(30);
+
+        loop {
+            if Instant::now() >= next_tier_check {
+                let new_target = current_batch_size();
+                if new_target != current_target {
+                    tracing::info!(
+                        old_batch = current_target,
+                        new_batch = new_target,
+                        tier = memory_tier().as_str(),
+                        "[DBWRITER] adaptive batch size refreshed"
+                    );
+                    current_target = new_target;
+                }
+                next_tier_check = Instant::now() + Duration::from_secs(30);
+            }
+
+            let timeout = deadline
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(FLUSH_INTERVAL);
+
+            let recv = tokio::time::timeout(timeout, input.recv()).await;
+            match recv {
+                Ok(Some(file)) => {
+                    if buffer.is_empty() {
+                        deadline = Some(Instant::now() + FLUSH_INTERVAL);
+                    }
+                    buffer.push(file);
+                    if buffer.len() >= current_target {
+                        let stats = self.flush(&mut buffer, &mut total, &mut failed, batch_index)?;
+                        batch_index += 1;
+                        deadline = None;
+                        on_batch(stats);
+                    }
+                }
+                Ok(None) => {
+                    if !buffer.is_empty() {
+                        let stats = self.flush(&mut buffer, &mut total, &mut failed, batch_index)?;
+                        on_batch(stats);
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if !buffer.is_empty() {
+                        let stats = self.flush(&mut buffer, &mut total, &mut failed, batch_index)?;
+                        batch_index += 1;
+                        deadline = None;
+                        on_batch(stats);
+                    }
+                }
+            }
+            if self.coordinator.is_cancelled() {
+                // Flush any rows that finished the (paid-for) ML pipeline before
+                // the cancel landed but hadn't hit a batch boundary yet — else up
+                // to current_target-1 fully-tagged files are dropped and must be
+                // fully re-processed on the next scan. Mirrors the Ok(None)/Err
+                // drain arms above.
+                if !buffer.is_empty() {
+                    let stats = self.flush(&mut buffer, &mut total, &mut failed, batch_index)?;
+                    on_batch(stats);
+                }
+                break;
+            }
+        }
+        Ok((total, failed))
+    }
+
+    /// Persist `buffer` in a single transaction. Empties the buffer.
+    fn flush(
+        &self,
+        buffer: &mut Vec<TaggedFile>,
+        total: &mut u64,
+        failed: &mut u64,
+        batch_index: u32,
+    ) -> Result<BatchStats> {
+        if buffer.is_empty() {
+            return Ok(BatchStats::default());
+        }
+
+        let started = Instant::now();
+        let mut vision = Vec::with_capacity(buffer.len());
+        let mut clip = Vec::with_capacity(buffer.len());
+        let mut store = Vec::with_capacity(buffer.len());
+        let files_in_batch = buffer.len() as u32;
+
+        // Face-crop ids orphaned by faces_evaluated re-processing, pruned AFTER
+        // the batch commits — never inside the tx, so a batch rollback (which
+        // restores the old face_prints rows) can't leave them crop-less.
+        let mut crop_ids_to_prune: Vec<i64> = Vec::new();
+        // (face_id, crop bytes) to encode + write AFTER commit, outside the writer
+        // lock — the JPEG encode + fs::write must not run inside the tx. (audit P1)
+        let mut crops_to_write: Vec<(i64, Vec<u8>)> = Vec::new();
+
+        // Recipe-v1 legacy digests for over-cap files (>FULL_HASH_MAX_BYTES):
+        // computing one re-reads ~2 MB (head ‖ tail) off disk. Done BEFORE the
+        // writer lock so the blocking IO never runs inside the single-writer tx —
+        // a slow/sleeping disk on one over-cap file would otherwise stall every
+        // reader-blocking writer-lock holder for the whole batch. (F-C1-025)
+        // Index-parallel to `buffer`; `None` for files that need no legacy probe.
+        // Same guard the inline read used: only over-cap rows that carry a
+        // content_hash can match the recipe-v1 fallback (?4) below.
+        let legacy_hashes: Vec<Option<[u8; 32]>> = buffer
+            .iter()
+            .map(|f| {
+                if f.content_hash.is_some()
+                    && f.size_bytes > crate::util::content_hash::FULL_HASH_MAX_BYTES
+                {
+                    crate::util::content_hash::legacy_content_hash(&f.path, f.size_bytes).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Canonical text preparation and cache IO happen before taking the
+        // single-writer lock. SQLite remains authoritative; a shadow-cache
+        // failure only omits `shadow_cache_key` and never drops searchable text.
+        let semantic_updates: Vec<SemanticBatchUpdate> = buffer
+            .iter()
+            .map(|f| {
+                if f.metadata_only || !(f.doc_stage_ran || f.ocr_stage_ran) {
+                    return SemanticBatchUpdate::Skip;
+                }
+                let canonical = f
+                    .doc_text
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                    .or_else(|| {
+                        f.ocr_text
+                            .as_deref()
+                            .filter(|text| !text.trim().is_empty())
+                    });
+                let Some(canonical) = canonical else {
+                    return SemanticBatchUpdate::Clear;
+                };
+                let Some(content_hash) = f.content_hash.as_ref() else {
+                    tracing::warn!(
+                        path = %crate::platform::redact_path_for_log(&f.path),
+                        "canonical text has no content hash; deferring semantic cache update"
+                    );
+                    return SemanticBatchUpdate::Skip;
+                };
+                let Some(content) =
+                    semantic_content::prepare(f.kind.as_str(), content_hash, canonical)
+                else {
+                    return SemanticBatchUpdate::Clear;
+                };
+                let shadow_ready = match semantic_content::write_shadow(
+                    &content.cache_key,
+                    &content.markdown,
+                ) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            path = %crate::platform::redact_path_for_log(&f.path),
+                            "semantic shadow cache write failed; SQLite text remains authoritative"
+                        );
+                        false
+                    }
+                };
+                SemanticBatchUpdate::Replace {
+                    content,
+                    shadow_ready,
+                }
+            })
+            .collect();
+
+        // Rename/move heal old-path existence is resolved BEFORE the writer
+        // lock: `heal_candidate_moved()` does a blocking `symlink_metadata()`
+        // stat (is the candidate's old path still on disk?). On a dead/slow
+        // mount (unmounted NAS, pulled SD/external drive) that stat can block
+        // for the full fs/SMB timeout; inside the tx it would stall the single
+        // writer for the whole batch — the same hazard the `legacy_hashes` hoist
+        // above and the post-commit crop write defend against. Enumerate
+        // candidate old paths under a brief read lock, then stat them with the
+        // writer lock RELEASED, into a path -> "gone" map the in-tx loop
+        // consults instead of statting. (audit R3-16)
+        let heal_old_path_gone: std::collections::HashMap<String, bool> = {
+            let mut old_paths: Vec<String> = Vec::new();
+            {
+                let conn = self.conn.lock();
+                let mut heal_lookup = conn
+                    .prepare_cached(HEAL_LOOKUP_SQL)
+                    .context("preparing rename-heal lookup (pre-pass)")?;
+                for (i, f) in buffer.iter().enumerate() {
+                    if f.file_ref.is_none() && f.content_hash.is_none() {
+                        continue;
+                    }
+                    let path_text = f.path.to_string_lossy();
+                    let rows = heal_lookup
+                        .query_map(
+                            params![
+                                f.file_ref.map(|r| r as i64),
+                                f.content_hash.as_ref().map(|h| h.as_slice()),
+                                path_text.as_ref(),
+                                legacy_hashes[i].as_ref().map(|h| h.as_slice()),
+                                f.size_bytes as i64,
+                                f.volume_serial.map(i64::from),
+                            ],
+                            |r| r.get::<_, String>(1),
+                        )
+                        .context("rename-heal lookup (pre-pass)")?;
+                    for old in rows {
+                        old_paths.push(old.context("rename-heal lookup row (pre-pass)")?);
+                    }
+                }
+            } // writer lock released before any filesystem IO
+            old_paths.sort();
+            old_paths.dedup();
+            old_paths
+                .into_iter()
+                .map(|old| {
+                    let gone = heal_candidate_moved(false, &old);
+                    (old, gone)
+                })
+                .collect()
+        };
+
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction().context("opening tx")?;
+        {
+            // INSERT ... RETURNING id (SQLite 3.35+, bundled is 3.46+)
+            // eliminates the per-row "SELECT id FROM files WHERE path_text = ?"
+            // round-trip. Previously the dbwriter ran one INSERT + one SELECT
+            // per file = 2N statement executions per batch; this drops to N.
+            // The RETURNING clause yields the row id whether the row was
+            // freshly inserted OR updated via the ON CONFLICT DO UPDATE
+            // branch — same id stability the SELECT provided.
+            let mut file_stmt = tx
+                .prepare_cached(INSERT_FILE_RETURNING_ID_SQL)
+                .context("preparing file insert (RETURNING)")?;
+            let mut semantic_state_stmt = tx
+                .prepare_cached(
+                    "SELECT id, internal_asset_id, content_hash, content_version \
+                     FROM files WHERE path_text = ?1 LIMIT 1",
+                )
+                .context("preparing semantic state lookup")?;
+            let mut semantic_asset_stmt = tx
+                .prepare_cached(
+                    "INSERT INTO semantic_assets \
+                     (internal_asset_id, content_hash, content_version, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?4) \
+                     ON CONFLICT(internal_asset_id) DO UPDATE SET \
+                       content_hash = COALESCE(excluded.content_hash, content_hash), \
+                       content_version = excluded.content_version, updated_at = excluded.updated_at",
+                )
+                .context("preparing semantic asset upsert")?;
+            let mut semantic_replace_stmt = tx
+                .prepare_cached(
+                    "UPDATE semantic_assets SET canonical_text = ?1, shadow_cache_key = ?2, \
+                       content_hash = ?3, content_version = ?4, updated_at = ?5 \
+                     WHERE internal_asset_id = ?6",
+                )
+                .context("preparing canonical text replacement")?;
+            let mut semantic_clear_stmt = tx
+                .prepare_cached(
+                    "UPDATE semantic_assets SET canonical_text = NULL, shadow_cache_key = NULL, \
+                       updated_at = ?1 WHERE internal_asset_id = ?2",
+                )
+                .context("preparing canonical text clear")?;
+            let mut content_chunks_delete = tx
+                .prepare_cached("DELETE FROM content_chunks WHERE internal_asset_id = ?1")
+                .context("preparing content chunk delete")?;
+            let mut content_chunk_insert = tx
+                .prepare_cached(
+                    "INSERT INTO content_chunks \
+                     (chunk_id, internal_asset_id, content_hash, ordinal, heading, byte_offset, text) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .context("preparing content chunk insert")?;
+            let mut heal_lookup_stmt = tx
+                .prepare_cached(HEAL_LOOKUP_SQL)
+                .context("preparing rename-heal lookup")?;
+            let mut heal_update_stmt = tx
+                .prepare_cached(HEAL_UPDATE_SQL)
+                .context("preparing rename-heal update")?;
+            let mut clip_stmt = tx
+                .prepare_cached(INSERT_CLIP_SQL)
+                .context("preparing clip insert")?;
+            let mut text_embed_stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO text_embeddings (file_id, embedding, model) \
+                     VALUES (?1, ?2, ?3)",
+                )
+                .context("preparing text_embeddings insert")?;
+            let mut face_delete = tx
+                .prepare_cached("DELETE FROM face_prints WHERE file_id = ?1")
+                .context("preparing face delete")?;
+            let mut face_stmt = tx
+                .prepare_cached(INSERT_FACE_SQL)
+                .context("preparing face insert")?;
+            let mut tag_delete = tx
+                .prepare_cached("DELETE FROM tags WHERE file_id = ?1 AND source = 'auto'")
+                .context("preparing tag delete")?;
+            let mut tag_insert = tx
+                .prepare_cached("INSERT OR REPLACE INTO tags (file_id, tag, source, score) VALUES (?1, ?2, 'auto', ?3)")
+                .context("preparing tag insert")?;
+            // ocr_fts/doc_fts are owned by the v15 sync triggers, so only the
+            // content tables are touched here. Explicit DELETE + INSERT rather
+            // than INSERT OR REPLACE: REPLACE's implicit delete fires the
+            // AFTER DELETE trigger only when recursive triggers are enabled,
+            // which would strand the old text's FTS postings.
+            let mut ocr_text_stmt = tx
+                .prepare_cached("INSERT INTO ocr_text (file_id, text) VALUES (?1, ?2)")
+                .context("preparing ocr_text insert")?;
+            let mut ocr_text_delete = tx
+                .prepare_cached("DELETE FROM ocr_text WHERE file_id = ?1")
+                .context("preparing ocr_text delete")?;
+            let mut doc_text_stmt = tx
+                .prepare_cached("INSERT INTO doc_text (file_id, text) VALUES (?1, ?2)")
+                .context("preparing doc_text insert")?;
+            let mut doc_text_delete = tx
+                .prepare_cached("DELETE FROM doc_text WHERE file_id = ?1")
+                .context("preparing doc_text delete")?;
+            for (i, f) in buffer.iter().enumerate() {
+                let insert_started = Instant::now();
+                let path_text = f.path.to_string_lossy();
+                // Path redaction is computed lazily INSIDE each error-context
+                // closure below (which almost never runs), not eagerly per file:
+                // redact_path_for_log does two to_lowercase allocs + a paths::root()
+                // lookup, wasted on every row of a 140 files/s flush. The redacted
+                // (never raw) path is still what lands in the log + IPC wire on a
+                // real flush error. (audit P3)
+                let path_hash = crate::util::path_safety::stable_path_hash(&path_text);
+                // NFC-normalized search shadow of the path (v16 contract). macOS
+                // writers store `precomposedStringWithCanonicalMapping`; the
+                // Windows engine must match so an NFD filename (Mac/NAS/Dropbox-
+                // synced) is found by the app's NFC query. ASCII is the identity
+                // case (no alloc); only non-ASCII paths compose. (F-C2-005)
+                let path_search = nfc_path_search(&path_text);
+                let extension = f
+                    .path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+
+                // Rename/move heal: if an existing row matches this file's
+                // content identity at a DIFFERENT path, move it to the new
+                // path BEFORE the INSERT. The ON CONFLICT(path_text) clause
+                // below then updates the (now-relocated) existing row,
+                // preserving its id + every FK-linked row (tags / embeddings /
+                // faces / OCR) — what the rename-heal is for. Skipped when we
+                // have neither identity (no heal possible).
+                if f.file_ref.is_some() || f.content_hash.is_some() {
+                    let ch_bytes = f.content_hash.as_ref().map(|h| h.as_slice());
+                    // Recipe-v1 fallback (?4): over-cap rows stamped by builds
+                    // before the composite hash gained interior samples hold
+                    // blake3(head ‖ tail ‖ size) — a 2 MB read reproduces it so
+                    // those rows still heal; the upsert below re-stamps the
+                    // current recipe. The read was hoisted out of the writer lock
+                    // (computed into `legacy_hashes` before `conn.lock()`). (F-C1-025)
+                    let legacy_hash = legacy_hashes[i];
+                    let candidates: Vec<(i64, String, bool)> = heal_lookup_stmt
+                        .query_map(
+                            params![
+                                f.file_ref.map(|r| r as i64),
+                                ch_bytes,
+                                path_text.as_ref(),
+                                legacy_hash.as_ref().map(|h| h.as_slice()),
+                                f.size_bytes as i64,
+                                f.volume_serial.map(i64::from),
+                            ],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+                        )
+                        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+                        .with_context(|| format!("rename-heal lookup for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                    // Heal the FIRST identity match whose old path genuinely MOVED
+                    // (is gone from disk). Iterating — rather than the old
+                    // LIMIT-1/no-ORDER-BY single fetch — ensures a still-present
+                    // coexisting COPY returned ahead of the real orphan doesn't
+                    // skip the heal and leave the genuinely-moved file's prior row
+                    // (with its tags/faces) orphaned forever. file_ref matches are
+                    // ordered first in SQL (the precise rename signal).
+                    if let Some((id, _old, _by_ref)) = candidates
+                        .into_iter()
+                        .find(|(_, old, _by_ref)| heal_old_path_gone.get(old).copied().unwrap_or(false))
+                    {
+                        match heal_update_stmt.execute(params![path_text, path_hash, id, path_search]) {
+                            Ok(_) => tracing::info!(
+                                id,
+                                new_path = %crate::platform::redact_path_for_log(&f.path),
+                                "[RENAME-HEAL] re-bound existing row to new path"
+                            ),
+                            // A content-identical COPY already occupies the new path
+                            // (scanned there independently). Skip the heal rather than
+                            // OR REPLACE-deleting that row — which silently orphaned its
+                            // FTS5 external-content index (ocr_fts/doc_fts have no delete
+                            // triggers, so the rowid entries would be left dangling). The
+                            // moved-away orphan keeps its old path and is cleaned by
+                            // orphan-pruning; the existing row is updated by the INSERT
+                            // ON CONFLICT below. (audit recheck: rename-heal FTS desync)
+                            Err(rusqlite::Error::SqliteFailure(sf, _))
+                                if sf.code == rusqlite::ErrorCode::ConstraintViolation =>
+                            {
+                                tracing::debug!(
+                                    id,
+                                    "[RENAME-HEAL] new path already occupied by a copy; skipping heal"
+                                );
+                            }
+                            Err(e) => {
+                                Err::<(), _>(e).with_context(|| {
+                                    format!(
+                                        "rename-heal update for {}",
+                                        crate::platform::redact_path_for_log(&f.path)
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                }
+
+                // The heal above has already rebound a moved file to this path,
+                // so this lookup sees the correct prior physical row. A changed
+                // hash invalidates all derived AI/OCR state; a pure rename/move
+                // keeps it and does not bump `content_version`.
+                let previous_semantic: Option<(i64, String, Option<Vec<u8>>, i64)> =
+                    semantic_state_stmt
+                        .query_row(params![path_text.as_ref()], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        })
+                        .optional()
+                        .with_context(|| {
+                            format!(
+                                "semantic state lookup for {}",
+                                crate::platform::redact_path_for_log(&f.path)
+                            )
+                        })?;
+                let content_changed = previous_semantic
+                    .as_ref()
+                    .and_then(|(_, _, previous_hash, _)| previous_hash.as_deref())
+                    .zip(f.content_hash.as_ref().map(|hash| hash.as_slice()))
+                    .is_some_and(|(previous, current)| previous != current);
+                if content_changed {
+                    let (old_file_id, internal_asset_id, _, old_version) =
+                        previous_semantic.as_ref().expect("content change requires prior row");
+                    crate::db::catalog::invalidate_changed_content(
+                        &tx,
+                        *old_file_id,
+                        internal_asset_id,
+                        f.content_hash.as_ref().map(|hash| hash.as_slice()),
+                        old_version.saturating_add(1),
+                        f.scanned_unix,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "invalidating changed content for {}",
+                            crate::platform::redact_path_for_log(&f.path)
+                        )
+                    })?;
+                }
+
+                let file_id: i64 = file_stmt
+                    .query_row(
+                        params![
+                            path_text,
+                            path_hash,
+                            f.size_bytes as i64,
+                            f.created_unix,
+                            f.modified_unix,
+                            f.scanned_unix,
+                            f.kind.as_str(),
+                            extension,
+                            f.phash,
+                            f.aesthetic,
+                            f.has_faces as i64,
+                            f.has_text as i64,
+                            f.camera_model,
+                            f.location_lat,
+                            f.location_lon,
+                            f.failed as i64,
+                            f.error_message,
+                            f.content_hash.as_ref().map(|h| h.as_slice()),
+                            f.file_ref.map(|r| r as i64),
+                            path_search,
+                            f.volume_serial.map(i64::from),
+                            i64::from(f.metadata_only),
+                            // ?23/?24 stage-ran gates for the has_faces/has_text
+                            // CASE WHEN in the upsert (R3-04).
+                            f.faces_evaluated,
+                            f.ocr_stage_ran || f.doc_stage_ran,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .with_context(|| format!("insert+id for {}", crate::platform::redact_path_for_log(&f.path)))?;
+
+                let (internal_asset_id, content_version, persisted_hash):
+                    (String, i64, Option<Vec<u8>>) = tx
+                    .query_row(
+                        "SELECT internal_asset_id, content_version, content_hash FROM files WHERE id = ?1",
+                        params![file_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "loading persisted semantic identity for {}",
+                            crate::platform::redact_path_for_log(&f.path)
+                        )
+                    })?;
+                semantic_asset_stmt
+                    .execute(params![
+                        internal_asset_id,
+                        persisted_hash.as_deref(),
+                        content_version,
+                        f.scanned_unix,
+                    ])
+                    .with_context(|| {
+                        format!(
+                            "semantic asset upsert for {}",
+                            crate::platform::redact_path_for_log(&f.path)
+                        )
+                    })?;
+
+                match &semantic_updates[i] {
+                    SemanticBatchUpdate::Skip => {}
+                    SemanticBatchUpdate::Clear => {
+                        content_chunks_delete.execute(params![internal_asset_id])?;
+                        semantic_clear_stmt
+                            .execute(params![f.scanned_unix, internal_asset_id])?;
+                    }
+                    SemanticBatchUpdate::Replace {
+                        content,
+                        shadow_ready,
+                    } => {
+                        let Some(content_hash) = f.content_hash.as_ref() else {
+                            unreachable!("prepared semantic content always has a content hash")
+                        };
+                        content_chunks_delete.execute(params![internal_asset_id])?;
+                        semantic_replace_stmt.execute(params![
+                            content.canonical_text,
+                            shadow_ready.then_some(content.cache_key.as_str()),
+                            content_hash.as_slice(),
+                            content_version,
+                            f.scanned_unix,
+                            internal_asset_id,
+                        ])?;
+                        for chunk in &content.chunks {
+                            let chunk_id = format!(
+                                "{}:{}:{}",
+                                internal_asset_id, content.cache_key, chunk.ordinal
+                            );
+                            content_chunk_insert.execute(params![
+                                chunk_id,
+                                internal_asset_id,
+                                content_hash.as_slice(),
+                                chunk.ordinal as i64,
+                                chunk.heading,
+                                chunk.byte_offset as i64,
+                                chunk.text,
+                            ])?;
+                        }
+                    }
+                }
+
+                if let Some(emb) = &f.clip_embedding {
+                    let bytes = floats_to_le_bytes(emb);
+                    clip_stmt
+                        .execute(params![file_id, bytes, "mobileclip_s2"])
+                        .with_context(|| format!("clip insert for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                }
+
+                // BGE-small text embeddings (Phase 4b) — parallel to clip
+                // above but in a different vector space; persisted into
+                // `text_embeddings` keyed by model so future embeddings
+                // (BGE-m3, Nomic, ...) can coexist without table churn.
+                if let Some(emb) = &f.text_embedding {
+                    let bytes = floats_to_le_bytes(emb);
+                    text_embed_stmt
+                        .execute(params![file_id, bytes, "bge_small_en_v1_5"])
+                        .with_context(|| format!("text_embeddings insert for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                }
+
+                // Key the stale-face DELETE on whether the face stage actually
+                // ran this session, NOT on `faces.is_empty()`: an edited/zero-
+                // face re-process must clear orphaned face_prints (else they
+                // keep polluting clusters), while a face-disabled / GPU-dead
+                // session leaves still-valid rows intact (#5). The insert loop
+                // is naturally a no-op when there are no faces.
+                if f.faces_evaluated {
+                    // Capture the face ids being replaced so their now-orphaned
+                    // crop JPEGs (face_crops/<id>.jpg) can be pruned below: the
+                    // re-inserted faces get fresh AUTOINCREMENT ids, so without
+                    // this every faces_evaluated re-process leaks the prior crops
+                    // on disk (face_crops/ grows unbounded across re-scans).
+                    let stale_face_ids: Vec<i64> = {
+                        let mut q =
+                            tx.prepare_cached("SELECT id FROM face_prints WHERE file_id = ?1")?;
+                        let ids = q
+                            .query_map(params![file_id], |r| r.get::<_, i64>(0))?
+                            .filter_map(|r| r.ok())
+                            .collect::<Vec<_>>();
+                        ids
+                    };
+                    face_delete
+                        .execute(params![file_id])
+                        .with_context(|| format!("face delete for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                    for face in &f.faces {
+                        let bbox_json = serde_json::json!({
+                            "x": face.bbox[0],
+                            "y": face.bbox[1],
+                            "w": face.bbox[2],
+                            "h": face.bbox[3],
+                            "roll": face.roll,
+                            "yaw": face.yaw,
+                            "pitch": face.pitch,
+                        })
+                        .to_string();
+                        let arcface_bytes = floats_to_le_bytes(&face.embedding);
+                        // print_data legacy: same bytes as arcface_embedding so old code keeps working.
+                        face_stmt
+                            .execute(params![
+                                file_id,
+                                arcface_bytes.as_slice(),
+                                bbox_json,
+                                arcface_bytes.as_slice(),
+                                face.quality as f64,
+                                face.excluded as i64,
+                            ])
+                            .with_context(|| format!("face insert for {}", crate::platform::redact_path_for_log(&f.path)))?;
+
+                        if let Some(crop) = &face.crop_rgb_112 {
+                            let face_id = tx.last_insert_rowid();
+                            // Defer the JPEG encode + fs::write to after commit so it
+                            // never runs inside the tx under the writer lock. (audit P1)
+                            crops_to_write.push((face_id, crop.clone()));
+                        }
+                    }
+                    // New AUTOINCREMENT ids never collide with the deleted ones,
+                    // so every captured id is now orphaned. Defer the file delete
+                    // until after commit (below) so a rollback can't orphan crops.
+                    crop_ids_to_prune.extend(stale_face_ids);
+                }
+
+                // Delete-then-conditional-insert, but ONLY when the OCR stage
+                // actually ran this session — never on the ambiguous default-
+                // skip path. This clears stale ocr_text (and, via the v15
+                // triggers, ocr_fts) when a re-process now yields empty text
+                // (phantom FTS hits, #11) while leaving valid prior text
+                // untouched on the common skipped sessions.
+                if f.ocr_stage_ran {
+                    ocr_text_delete
+                        .execute(params![file_id])
+                        .with_context(|| format!("ocr_text delete for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                    if let Some(text) = &f.ocr_text {
+                        if !text.trim().is_empty() {
+                            ocr_text_stmt
+                                .execute(params![file_id, text])
+                                .with_context(|| format!("ocr_text insert for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                        }
+                    }
+                }
+
+                // Phase 4: document text — same stage-ran-gated
+                // delete-then-conditional-insert as ocr_text above (#11).
+                if f.doc_stage_ran {
+                    doc_text_delete
+                        .execute(params![file_id])
+                        .with_context(|| format!("doc_text delete for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                    if let Some(text) = &f.doc_text {
+                        if !text.trim().is_empty() {
+                            doc_text_stmt
+                                .execute(params![file_id, text])
+                                .with_context(|| format!("doc_text insert for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                        }
+                    }
+                }
+
+                // Auto-tags (classifier output + enriched extras). Gate the
+                // delete-then-reinsert on whether the tagging stage actually ran
+                // this session — exactly like faces_evaluated / ocr_stage_ran /
+                // doc_stage_ran above. A per-file timeout row or a GPU-dead
+                // short-circuit emits an EMPTY `tags` vec; without this gate the
+                // unconditional DELETE would wipe a file's previously-persisted
+                // RAM++/CLIP-scene/Year/camera auto-tags on a transient slow read
+                // or a mid-scan GPU TDR, with nothing re-inserted (data loss).
+                // When the stage DID run, delete any prior `source='auto'` rows
+                // and re-insert the fresh set atomically. User tags
+                // (`source='user'`) are untouched either way.
+                if f.tags_evaluated {
+                    tag_delete
+                        .execute(params![file_id])
+                        .with_context(|| format!("tag delete for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                    for (tag, score) in &f.tags {
+                        let trimmed = tag.trim();
+                        if trimmed.is_empty() { continue; }
+                        tag_insert
+                            .execute(params![file_id, trimmed, score.map(|s| s as f64)])
+                            .with_context(|| format!("tag insert for {}", crate::platform::redact_path_for_log(&f.path)))?;
+                    }
+                }
+
+                if f.failed {
+                    *failed += 1;
+                }
+                *total += 1;
+                vision.push(f.vision_ms);
+                clip.push(f.clip_ms);
+                let insert_ms = insert_started.elapsed().as_secs_f64() * 1000.0;
+                store.push(insert_ms);
+                if std::env::var_os("FILEID_PERF_TRACE").is_some() {
+                    tracing::debug!(
+                        target: "FileIDEngine::perf",
+                        stage = "db_write_done",
+                        path = %crate::platform::redact_path_for_log(&f.path),
+                        elapsed_ms = insert_ms,
+                        "[PERF]"
+                    );
+                }
+            }
+        }
+        tx.commit().context("commit batch")?;
+
+        // Batch is durable; now prune crop JPEGs for the face ids it replaced.
+        // (After commit so a rolled-back batch never deletes a live crop.)
+        for old_id in crop_ids_to_prune {
+            remove_face_crop(old_id);
+        }
+
+        // Periodic WAL checkpoint to keep the -wal file from growing
+        // unboundedly on long scans. SQLite's auto-checkpoint (on this
+        // connection) fires at ~1000 pages, but a -wal that never goes
+        // through TRUNCATE keeps growing on disk. Every WAL_CHECKPOINT_BATCHES
+        // commits we ask for a PASSIVE checkpoint; on success the WAL
+        // gets truncated next time it crosses the threshold. PASSIVE
+        // doesn't block readers, so this is safe to call from the
+        // hot scan path.
+        const WAL_CHECKPOINT_BATCHES: u32 = 32;
+        if batch_index > 0 && batch_index % WAL_CHECKPOINT_BATCHES == 0 {
+            // Invariant: no transaction open at this point — tx.commit
+            // above closes it, and we're the only writer (the mutex
+            // around conn enforces single-writer). Asserting via
+            // is_autocommit() catches a future regression where someone
+            // adds a BEGIN before this block.
+            debug_assert!(
+                conn.is_autocommit(),
+                "WAL checkpoint must not run inside an open transaction"
+            );
+            // Best-effort — failure here just means the WAL stays a
+            // little larger; it doesn't break correctness. A
+            // SQLITE_BUSY here is normal if a reader is mid-query.
+            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+                tracing::debug!(?e, batch_index, "periodic WAL checkpoint failed (transient, continuing)");
+            }
+        }
+
+        drop(conn);
+
+        // Encode + write the batch's face-crop JPEGs now — AFTER the tx committed
+        // and the writer lock dropped — so per-face JPEG encode + fs::write never
+        // blocks the engine's only writer (or a concurrent scan flush). (audit P1)
+        for (face_id, crop) in &crops_to_write {
+            if let Err(err) = save_face_crop(*face_id, crop) {
+                tracing::warn!(?err, face_id = *face_id, "face crop write failed");
+            }
+        }
+
+        let wall = started.elapsed().as_secs_f64();
+        buffer.clear();
+
+        Ok(BatchStats {
+            batch_index,
+            files_in_batch,
+            processed_total: *total,
+            failed_total: *failed,
+            wall_seconds: wall,
+            files_per_second: if wall > 0.0 { f64::from(files_in_batch) / wall } else { 0.0 },
+            utilization: 0.0,
+            vision_p50_ms: percentile(&mut vision, 0.50),
+            vision_p95_ms: percentile(&mut vision, 0.95),
+            clip_p50_ms: percentile(&mut clip, 0.50),
+            clip_p95_ms: percentile(&mut clip, 0.95),
+            store_insert_p50_ms: percentile(&mut store, 0.50),
+            store_insert_p95_ms: percentile(&mut store, 0.95),
+        })
+    }
+}
+
+fn percentile(values: &mut [f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((values.len() as f64 - 1.0) * p).round() as usize;
+    values[idx]
+}
+
+/// Bare INSERT (no RETURNING) — retained for test fixtures that don't
+/// need the id. The hot-path writer uses `INSERT_FILE_RETURNING_ID_SQL`
+/// below, which is identical plus a `RETURNING id` suffix.
+/// `path_search` (?20) is bound the NFC-normalized path (`nfc_path_search`),
+/// NOT the verbatim `path_text` (?1) — the v16 contract, so NFD filenames are
+/// found by the app's NFC query (F-C2-005).
+#[allow(dead_code)]  // used by test fixtures only; bin path uses the RETURNING variant.
+const INSERT_FILE_SQL: &str = r#"
+    INSERT INTO files (
+        path_text, path_hash, size_bytes,
+        created_at, modified_at, scanned_at,
+        kind, extension,
+        phash, aesthetic,
+        has_faces, has_text,
+        camera_model, location_lat, location_lon,
+        failed, error_message,
+        content_hash, file_ref, path_search, volume_serial, metadata_only
+    )
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+    ON CONFLICT(path_text) DO UPDATE SET
+        path_hash    = excluded.path_hash,
+        path_search  = excluded.path_search,
+        size_bytes   = excluded.size_bytes,
+        modified_at  = excluded.modified_at,
+        scanned_at   = excluded.scanned_at,
+        kind         = excluded.kind,
+        extension    = excluded.extension,
+        -- Preserve previously-computed vision/EXIF metadata when this re-scan
+        -- produced no value (decode failed, file lock, mid-scan GPU TDR, or an
+        -- online-only/dehydrated placeholder leaves these NULL). A genuine
+        -- content change bumps modified_at and the successful re-decode supplies
+        -- a fresh Some(_) that COALESCE picks instead. Mirrors content_hash. (R3-04)
+        phash        = COALESCE(excluded.phash, phash),
+        camera_model = COALESCE(excluded.camera_model, camera_model),
+        location_lat = COALESCE(excluded.location_lat, location_lat),
+        location_lon = COALESCE(excluded.location_lon, location_lon),
+        -- has_faces/has_text are NOT NULL 0/1, so COALESCE can't protect them.
+        -- Only overwrite when the producing stage actually ran this session
+        -- (?21 = faces_evaluated, ?22 = ocr/doc text stage ran) — keeps the
+        -- files row consistent with its still-present face_prints/ocr_text
+        -- children on a models-missing / GPU-dead / online-only re-scan. (R3-04)
+        has_faces    = CASE WHEN ?23 THEN excluded.has_faces ELSE has_faces END,
+        has_text     = CASE WHEN ?24 THEN excluded.has_text  ELSE has_text  END,
+        failed       = excluded.failed,
+        error_message= excluded.error_message,
+        content_hash = COALESCE(excluded.content_hash, content_hash),
+        content_version = CASE
+            WHEN excluded.content_hash IS NOT NULL
+             AND content_hash IS NOT NULL
+             AND excluded.content_hash <> content_hash
+            THEN content_version + 1
+            ELSE content_version
+        END,
+        file_ref     = COALESCE(excluded.file_ref, file_ref),
+        volume_serial = COALESCE(excluded.volume_serial, volume_serial),
+        metadata_only = excluded.metadata_only,
+        lifecycle_status = 'active',
+        deleted_at = NULL
+"#;
+
+/// Hot-path INSERT. Returns `id` whether the row was freshly inserted or
+/// updated via the ON CONFLICT DO UPDATE branch — SQLite 3.35+ guarantees
+/// RETURNING fires on both paths. Eliminates the per-row SELECT round
+/// trip the previous implementation paid (2N statement executions per
+/// batch → N).
+const INSERT_FILE_RETURNING_ID_SQL: &str = r#"
+    INSERT INTO files (
+        path_text, path_hash, size_bytes,
+        created_at, modified_at, scanned_at,
+        kind, extension,
+        phash, aesthetic,
+        has_faces, has_text,
+        camera_model, location_lat, location_lon,
+        failed, error_message,
+        content_hash, file_ref, path_search, volume_serial, metadata_only
+    )
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+    ON CONFLICT(path_text) DO UPDATE SET
+        path_hash    = excluded.path_hash,
+        path_search  = excluded.path_search,
+        size_bytes   = excluded.size_bytes,
+        modified_at  = excluded.modified_at,
+        scanned_at   = excluded.scanned_at,
+        kind         = excluded.kind,
+        extension    = excluded.extension,
+        -- Preserve previously-computed vision/EXIF metadata when this re-scan
+        -- produced no value (decode failed, file lock, mid-scan GPU TDR, or an
+        -- online-only/dehydrated placeholder leaves these NULL). A genuine
+        -- content change bumps modified_at and the successful re-decode supplies
+        -- a fresh Some(_) that COALESCE picks instead. Mirrors content_hash. (R3-04)
+        phash        = COALESCE(excluded.phash, phash),
+        camera_model = COALESCE(excluded.camera_model, camera_model),
+        location_lat = COALESCE(excluded.location_lat, location_lat),
+        location_lon = COALESCE(excluded.location_lon, location_lon),
+        -- has_faces/has_text are NOT NULL 0/1, so COALESCE can't protect them.
+        -- Only overwrite when the producing stage actually ran this session
+        -- (?23 = faces_evaluated, ?24 = ocr/doc text stage ran) — keeps the
+        -- files row consistent with its still-present face_prints/ocr_text
+        -- children on a models-missing / GPU-dead / online-only re-scan. (R3-04)
+        has_faces    = CASE WHEN ?23 THEN excluded.has_faces ELSE has_faces END,
+        has_text     = CASE WHEN ?24 THEN excluded.has_text  ELSE has_text  END,
+        failed       = excluded.failed,
+        error_message= excluded.error_message,
+        content_hash = COALESCE(excluded.content_hash, content_hash),
+        content_version = CASE
+            WHEN excluded.content_hash IS NOT NULL
+             AND content_hash IS NOT NULL
+             AND excluded.content_hash <> content_hash
+            THEN content_version + 1
+            ELSE content_version
+        END,
+        file_ref     = COALESCE(excluded.file_ref, file_ref),
+        volume_serial = COALESCE(excluded.volume_serial, volume_serial),
+        metadata_only = excluded.metadata_only,
+        lifecycle_status = 'active',
+        deleted_at = NULL
+    RETURNING id
+"#;
+
+// Rename/move heal lookup (v8 identity). Find an existing row whose
+// `file_ref` (volume-local; the common rename case) or `content_hash`
+// (cross-volume) matches, but at a DIFFERENT path. NULL identity columns
+// never match — a row without identity can't be healed. Also returns the
+// candidate's current `path_text` and a `by_ref` flag so the caller can
+// distinguish a true MOVE (file_ref reused only for the same file) from a
+// coexisting byte-identical COPY (two distinct files share a content_hash);
+// only the former may heal unconditionally — see the call site.
+// ?4 is the recipe-v1 digest (head+tail+size, no interior samples; NULL for
+// files at or below the full-hash cap): rows stamped by pre-interior-sample
+// builds hold that digest for >16 MB files, so without it the recipe change
+// would orphan every large file's row on its first post-upgrade move. The
+// upsert after the heal re-stamps the current recipe.
+const HEAL_LOOKUP_SQL: &str = r#"
+    SELECT id, path_text,
+           (?1 IS NOT NULL AND ?6 IS NOT NULL AND file_ref = ?1 AND volume_serial = ?6
+            AND size_bytes = ?5) AS by_ref
+    FROM files
+    WHERE path_text != ?3
+      AND (
+          (file_ref IS NOT NULL AND ?6 IS NOT NULL AND file_ref = ?1
+           AND volume_serial = ?6 AND size_bytes = ?5)
+          OR (content_hash IS NOT NULL AND content_hash IN (?2, ?4))
+      )
+    ORDER BY by_ref DESC
+    LIMIT 32
+"#;
+
+// Heal: move the existing row to the new path. `UPDATE OR REPLACE` handles
+// the rare case where ANOTHER row already sits at the new path (e.g. a copy
+// preceded the rename) — SQLite REPLACE deletes the colliding row and
+// FK-cascades its tags/embeddings/faces, then the healed row wins.
+// ?4 is the NFC-normalized search shadow (v16 contract) — bound separately
+// from ?1 (verbatim path_text) so a healed NFD path is still found by an NFC
+// query, mirroring the INSERT path. (F-C2-005)
+const HEAL_UPDATE_SQL: &str = r#"
+    UPDATE files
+       SET previous_path_text = path_text, path_text = ?1, path_hash = ?2, path_search = ?4,
+           lifecycle_status = 'active', deleted_at = NULL
+     WHERE id = ?3
+"#;
+
+/// Decide whether a heal candidate (an existing row matched by identity at a
+/// different path) genuinely MOVED, and may therefore re-bind to the new path.
+///
+/// Heal ONLY when the candidate's previous path no longer exists on disk — a
+/// genuine rename/move always leaves its old path gone. This single gate is
+/// required for BOTH match kinds. A `content_hash`-only match also fires for a
+/// COEXISTING byte-identical COPY (two distinct files share one BLAKE3). A
+/// `file_ref` (NTFS MFT id) match is only VOLUME-LOCAL, so two distinct files
+/// on different volumes (an external / SD / NAS drive scanned into the same
+/// library), or two hardlinks to one file, can collide on the same ref — the
+/// old `by_ref` short-circuit healed those unconditionally. Healing a
+/// coexisting file steals the original's row and, via `UPDATE OR REPLACE`,
+/// FK-cascades its tags/faces away — silent data loss. The old-path-gone gate
+/// keeps coexisting files as distinct rows while still healing every real move
+/// (whose old path is, by definition, gone). `symlink_metadata` (not
+/// `metadata`) so a dangling symlink still counts as present and is not treated
+/// as a move. (`_by_ref` is retained for the call site's tuple; the decision no
+/// longer depends on it.)
+fn heal_candidate_moved(_by_ref: bool, old_path: &str) -> bool {
+    std::fs::symlink_metadata(crate::util::path_safety::to_extended_length(
+        std::path::Path::new(old_path),
+    ))
+    .is_err()
+}
+
+const INSERT_CLIP_SQL: &str = r#"
+    INSERT INTO clip_embeddings (file_id, embedding, model)
+    VALUES (?1, ?2, ?3)
+    ON CONFLICT(file_id) DO UPDATE SET
+        embedding = excluded.embedding,
+        model     = excluded.model
+"#;
+
+const INSERT_FACE_SQL: &str = r#"
+    INSERT INTO face_prints (file_id, print_data, bbox, arcface_embedding, face_quality, excluded)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+"#;
+
+/// Convert a slice of f32 to little-endian bytes for BLOB storage.
+/// Matches the macOS GRDB layout exactly (CoreML / ORT both produce
+/// host-endian f32 → we always normalize to LE on the way to disk so a
+/// macOS DB opens cleanly on Windows even if endianness ever drifts).
+fn floats_to_le_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// NFC-normalize a path string for the `path_search` shadow column (v16
+/// contract). macOS writers store `precomposedStringWithCanonicalMapping`;
+/// this is the cross-platform-clean Windows mirror, dependency-free (no NFC
+/// crate is in the locked set). It composes the canonical Latin base+combining
+/// pairs — the real-world NFD filename surface (Mac/HFS+/APFS, NAS, Dropbox
+/// sync decompose accented names: "cafe\u{0301}" -> "caf\u{e9}"). ASCII and
+/// already-composed paths return unchanged via the fast path (no allocation),
+/// so the 140 files/s hot loop pays nothing on the common case. Stacked
+/// multi-mark sequences (vanishingly rare in filenames) are left as-is — still
+/// no worse than the prior verbatim behavior. (F-C2-005)
+///
+/// `pub(crate)` so the other path-mutating writers (restructure-apply, bulk
+/// rename, trash-restore) can reuse this single canonical normalizer instead
+/// of re-stamping `path_search = path_text` verbatim.
+pub fn nfc_path_search(path: &str) -> String {
+    // Fast path: a pure-ASCII path is already NFC (NFC is the identity on
+    // ASCII), so skip the scan + allocation entirely.
+    if path.is_ascii() {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(base) = chars.next() {
+        // Try to fold a following combining mark into `base`.
+        if let Some(&mark) = chars.peek() {
+            if let Some(composed) = compose_canonical(base, mark) {
+                out.push(composed);
+                chars.next();
+                continue;
+            }
+        }
+        out.push(base);
+    }
+    out
+}
+
+/// Look up the canonical composition of `base` + a single combining `mark`.
+/// Table is sorted by (base, mark) for binary search; generated from the
+/// Unicode canonical-decomposition data for the Latin range.
+fn compose_canonical(base: char, mark: char) -> Option<char> {
+    let key = (base as u32, mark as u32);
+    NFC_LATIN_COMPOSE
+        .binary_search_by(|&(b, m, _)| (b, m).cmp(&key))
+        .ok()
+        .and_then(|i| char::from_u32(NFC_LATIN_COMPOSE[i].2))
+}
+
+/// (base, combining-mark, precomposed) canonical-composition triples for the
+/// Latin-1 Supplement + Latin Extended-A range. Sorted by (base, mark).
+#[rustfmt::skip]
+const NFC_LATIN_COMPOSE: &[(u32, u32, u32)] = &[
+    (0x0041, 0x0300, 0x00C0), (0x0041, 0x0301, 0x00C1), (0x0041, 0x0302, 0x00C2), (0x0041, 0x0303, 0x00C3),
+    (0x0041, 0x0304, 0x0100), (0x0041, 0x0306, 0x0102), (0x0041, 0x0307, 0x0226), (0x0041, 0x0308, 0x00C4),
+    (0x0041, 0x030A, 0x00C5), (0x0041, 0x030C, 0x01CD), (0x0041, 0x030F, 0x0200), (0x0041, 0x0311, 0x0202),
+    (0x0041, 0x0328, 0x0104), (0x0043, 0x0301, 0x0106), (0x0043, 0x0302, 0x0108), (0x0043, 0x0307, 0x010A),
+    (0x0043, 0x030C, 0x010C), (0x0043, 0x0327, 0x00C7), (0x0044, 0x030C, 0x010E), (0x0045, 0x0300, 0x00C8),
+    (0x0045, 0x0301, 0x00C9), (0x0045, 0x0302, 0x00CA), (0x0045, 0x0304, 0x0112), (0x0045, 0x0306, 0x0114),
+    (0x0045, 0x0307, 0x0116), (0x0045, 0x0308, 0x00CB), (0x0045, 0x030C, 0x011A), (0x0045, 0x030F, 0x0204),
+    (0x0045, 0x0311, 0x0206), (0x0045, 0x0327, 0x0228), (0x0045, 0x0328, 0x0118), (0x0047, 0x0301, 0x01F4),
+    (0x0047, 0x0302, 0x011C), (0x0047, 0x0306, 0x011E), (0x0047, 0x0307, 0x0120), (0x0047, 0x030C, 0x01E6),
+    (0x0047, 0x0327, 0x0122), (0x0048, 0x0302, 0x0124), (0x0048, 0x030C, 0x021E), (0x0049, 0x0300, 0x00CC),
+    (0x0049, 0x0301, 0x00CD), (0x0049, 0x0302, 0x00CE), (0x0049, 0x0303, 0x0128), (0x0049, 0x0304, 0x012A),
+    (0x0049, 0x0306, 0x012C), (0x0049, 0x0307, 0x0130), (0x0049, 0x0308, 0x00CF), (0x0049, 0x030C, 0x01CF),
+    (0x0049, 0x030F, 0x0208), (0x0049, 0x0311, 0x020A), (0x0049, 0x0328, 0x012E), (0x004A, 0x0302, 0x0134),
+    (0x004B, 0x030C, 0x01E8), (0x004B, 0x0327, 0x0136), (0x004C, 0x0301, 0x0139), (0x004C, 0x030C, 0x013D),
+    (0x004C, 0x0327, 0x013B), (0x004E, 0x0300, 0x01F8), (0x004E, 0x0301, 0x0143), (0x004E, 0x0303, 0x00D1),
+    (0x004E, 0x030C, 0x0147), (0x004E, 0x0327, 0x0145), (0x004F, 0x0300, 0x00D2), (0x004F, 0x0301, 0x00D3),
+    (0x004F, 0x0302, 0x00D4), (0x004F, 0x0303, 0x00D5), (0x004F, 0x0304, 0x014C), (0x004F, 0x0306, 0x014E),
+    (0x004F, 0x0307, 0x022E), (0x004F, 0x0308, 0x00D6), (0x004F, 0x030B, 0x0150), (0x004F, 0x030C, 0x01D1),
+    (0x004F, 0x030F, 0x020C), (0x004F, 0x0311, 0x020E), (0x004F, 0x031B, 0x01A0), (0x004F, 0x0328, 0x01EA),
+    (0x0052, 0x0301, 0x0154), (0x0052, 0x030C, 0x0158), (0x0052, 0x030F, 0x0210), (0x0052, 0x0311, 0x0212),
+    (0x0052, 0x0327, 0x0156), (0x0053, 0x0301, 0x015A), (0x0053, 0x0302, 0x015C), (0x0053, 0x030C, 0x0160),
+    (0x0053, 0x0326, 0x0218), (0x0053, 0x0327, 0x015E), (0x0054, 0x030C, 0x0164), (0x0054, 0x0326, 0x021A),
+    (0x0054, 0x0327, 0x0162), (0x0055, 0x0300, 0x00D9), (0x0055, 0x0301, 0x00DA), (0x0055, 0x0302, 0x00DB),
+    (0x0055, 0x0303, 0x0168), (0x0055, 0x0304, 0x016A), (0x0055, 0x0306, 0x016C), (0x0055, 0x0308, 0x00DC),
+    (0x0055, 0x030A, 0x016E), (0x0055, 0x030B, 0x0170), (0x0055, 0x030C, 0x01D3), (0x0055, 0x030F, 0x0214),
+    (0x0055, 0x0311, 0x0216), (0x0055, 0x031B, 0x01AF), (0x0055, 0x0328, 0x0172), (0x0057, 0x0302, 0x0174),
+    (0x0059, 0x0301, 0x00DD), (0x0059, 0x0302, 0x0176), (0x0059, 0x0304, 0x0232), (0x0059, 0x0308, 0x0178),
+    (0x005A, 0x0301, 0x0179), (0x005A, 0x0307, 0x017B), (0x005A, 0x030C, 0x017D), (0x0061, 0x0300, 0x00E0),
+    (0x0061, 0x0301, 0x00E1), (0x0061, 0x0302, 0x00E2), (0x0061, 0x0303, 0x00E3), (0x0061, 0x0304, 0x0101),
+    (0x0061, 0x0306, 0x0103), (0x0061, 0x0307, 0x0227), (0x0061, 0x0308, 0x00E4), (0x0061, 0x030A, 0x00E5),
+    (0x0061, 0x030C, 0x01CE), (0x0061, 0x030F, 0x0201), (0x0061, 0x0311, 0x0203), (0x0061, 0x0328, 0x0105),
+    (0x0063, 0x0301, 0x0107), (0x0063, 0x0302, 0x0109), (0x0063, 0x0307, 0x010B), (0x0063, 0x030C, 0x010D),
+    (0x0063, 0x0327, 0x00E7), (0x0064, 0x030C, 0x010F), (0x0065, 0x0300, 0x00E8), (0x0065, 0x0301, 0x00E9),
+    (0x0065, 0x0302, 0x00EA), (0x0065, 0x0304, 0x0113), (0x0065, 0x0306, 0x0115), (0x0065, 0x0307, 0x0117),
+    (0x0065, 0x0308, 0x00EB), (0x0065, 0x030C, 0x011B), (0x0065, 0x030F, 0x0205), (0x0065, 0x0311, 0x0207),
+    (0x0065, 0x0327, 0x0229), (0x0065, 0x0328, 0x0119), (0x0067, 0x0301, 0x01F5), (0x0067, 0x0302, 0x011D),
+    (0x0067, 0x0306, 0x011F), (0x0067, 0x0307, 0x0121), (0x0067, 0x030C, 0x01E7), (0x0067, 0x0327, 0x0123),
+    (0x0068, 0x0302, 0x0125), (0x0068, 0x030C, 0x021F), (0x0069, 0x0300, 0x00EC), (0x0069, 0x0301, 0x00ED),
+    (0x0069, 0x0302, 0x00EE), (0x0069, 0x0303, 0x0129), (0x0069, 0x0304, 0x012B), (0x0069, 0x0306, 0x012D),
+    (0x0069, 0x0308, 0x00EF), (0x0069, 0x030C, 0x01D0), (0x0069, 0x030F, 0x0209), (0x0069, 0x0311, 0x020B),
+    (0x0069, 0x0328, 0x012F), (0x006A, 0x0302, 0x0135), (0x006A, 0x030C, 0x01F0), (0x006B, 0x030C, 0x01E9),
+    (0x006B, 0x0327, 0x0137), (0x006C, 0x0301, 0x013A), (0x006C, 0x030C, 0x013E), (0x006C, 0x0327, 0x013C),
+    (0x006E, 0x0300, 0x01F9), (0x006E, 0x0301, 0x0144), (0x006E, 0x0303, 0x00F1), (0x006E, 0x030C, 0x0148),
+    (0x006E, 0x0327, 0x0146), (0x006F, 0x0300, 0x00F2), (0x006F, 0x0301, 0x00F3), (0x006F, 0x0302, 0x00F4),
+    (0x006F, 0x0303, 0x00F5), (0x006F, 0x0304, 0x014D), (0x006F, 0x0306, 0x014F), (0x006F, 0x0307, 0x022F),
+    (0x006F, 0x0308, 0x00F6), (0x006F, 0x030B, 0x0151), (0x006F, 0x030C, 0x01D2), (0x006F, 0x030F, 0x020D),
+    (0x006F, 0x0311, 0x020F), (0x006F, 0x031B, 0x01A1), (0x006F, 0x0328, 0x01EB), (0x0072, 0x0301, 0x0155),
+    (0x0072, 0x030C, 0x0159), (0x0072, 0x030F, 0x0211), (0x0072, 0x0311, 0x0213), (0x0072, 0x0327, 0x0157),
+    (0x0073, 0x0301, 0x015B), (0x0073, 0x0302, 0x015D), (0x0073, 0x030C, 0x0161), (0x0073, 0x0326, 0x0219),
+    (0x0073, 0x0327, 0x015F), (0x0074, 0x030C, 0x0165), (0x0074, 0x0326, 0x021B), (0x0074, 0x0327, 0x0163),
+    (0x0075, 0x0300, 0x00F9), (0x0075, 0x0301, 0x00FA), (0x0075, 0x0302, 0x00FB), (0x0075, 0x0303, 0x0169),
+    (0x0075, 0x0304, 0x016B), (0x0075, 0x0306, 0x016D), (0x0075, 0x0308, 0x00FC), (0x0075, 0x030A, 0x016F),
+    (0x0075, 0x030B, 0x0171), (0x0075, 0x030C, 0x01D4), (0x0075, 0x030F, 0x0215), (0x0075, 0x0311, 0x0217),
+    (0x0075, 0x031B, 0x01B0), (0x0075, 0x0328, 0x0173), (0x0077, 0x0302, 0x0175), (0x0079, 0x0301, 0x00FD),
+    (0x0079, 0x0302, 0x0177), (0x0079, 0x0304, 0x0233), (0x0079, 0x0308, 0x00FF), (0x007A, 0x0301, 0x017A),
+    (0x007A, 0x0307, 0x017C), (0x007A, 0x030C, 0x017E), (0x00C6, 0x0301, 0x01FC), (0x00C6, 0x0304, 0x01E2),
+    (0x00D8, 0x0301, 0x01FE), (0x00E6, 0x0301, 0x01FD), (0x00E6, 0x0304, 0x01E3), (0x00F8, 0x0301, 0x01FF),
+    (0x01B7, 0x030C, 0x01EE), (0x0292, 0x030C, 0x01EF),
+];
+
+/// Encode a 112×112 RGB crop as JPEG and write to face_crops/<face_id>.jpg.
+/// Cheap (37 KB raw → ~5 KB JPEG @ q85). Lets the People tab card render
+/// real faces instead of placeholder gray circles.
+fn save_face_crop(face_id: i64, crop_rgb_112: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let dir = crate::paths::faces_dir().context("resolving faces dir")?;
+    std::fs::create_dir_all(&dir).ok();
+    let dest = dir.join(format!("{face_id}.jpg"));
+    let img: image::ImageBuffer<image::Rgb<u8>, _> =
+        image::ImageBuffer::from_raw(112, 112, crop_rgb_112.to_vec())
+            .context("face crop bytes don't match 112x112")?;
+    let dyn_img = image::DynamicImage::ImageRgb8(img);
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    dyn_img
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+        .context("encode face crop JPEG")?;
+    std::fs::write(&dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
+    Ok(())
+}
+
+/// Best-effort removal of a face crop JPEG (face_crops/<face_id>.jpg) orphaned
+/// by a faces_evaluated re-process. Silent on any error — a leftover crop is
+/// cosmetic disk use, never a correctness issue.
+pub(crate) fn remove_face_crop(face_id: i64) {
+    if let Ok(dir) = crate::paths::faces_dir() {
+        let _ = std::fs::remove_file(dir.join(format!("{face_id}.jpg")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::discovery::FileKind;
+    use rusqlite::OptionalExtension; // .optional() in ingest_with_heal (lib code no longer uses it)
+    use std::path::PathBuf;
+
+    /// Minimal mirror of the per-file body in `flush`. Exercises the
+    /// real INSERT_FILE_SQL constant under test so any drift in the
+    /// ON CONFLICT clause shows up here. Skips the embedding/face/ocr
+    /// branches — they have their own contracts; this asserts the
+    /// files-table de-dup contract specifically.
+    fn insert_one(conn: &Connection, f: &TaggedFile) -> Result<()> {
+        let path_text = f.path.to_string_lossy();
+        let path_hash = crate::util::path_safety::stable_path_hash(&path_text);
+        // Mirror the production `flush`: path_search (?20) is the NFC form.
+        let path_search = nfc_path_search(&path_text);
+        let extension = f
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        conn.execute(
+            INSERT_FILE_SQL,
+            params![
+                path_text,
+                path_hash,
+                f.size_bytes as i64,
+                None::<f64>,
+                f.modified_unix,
+                f.scanned_unix,
+                f.kind.as_str(),
+                extension,
+                f.phash,
+                None::<f64>,
+                f.has_faces as i64,
+                f.has_text as i64,
+                f.camera_model,
+                f.location_lat,
+                f.location_lon,
+                f.failed as i64,
+                f.error_message,
+                f.content_hash.as_ref().map(|h| h.as_slice()),
+                f.file_ref.map(|r| r as i64),
+                path_search,
+                f.volume_serial.map(i64::from),
+                i64::from(f.metadata_only),
+                f.faces_evaluated,
+                f.ocr_stage_ran || f.doc_stage_ran,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn fixture(path: &str) -> TaggedFile {
+        TaggedFile {
+            path: PathBuf::from(path),
+            kind: FileKind::Image,
+            size_bytes: 1234,
+            modified_unix: 1_700_000_000.0,
+            created_unix: None,
+            scanned_unix: 1_700_000_100.0,
+            has_faces: false,
+            faces: vec![],
+            has_text: false,
+            ocr_text: None,
+            phash: None,
+            aesthetic: None,
+            image_width: 0,
+            image_height: 0,
+            clip_embedding: None,
+            camera_model: None,
+            location_lat: None,
+            location_lon: None,
+            vision_ms: 0.0,
+            clip_ms: 0.0,
+            total_ms: 0.0,
+            failed: false,
+            error_message: None,
+            file_ref: None,
+            volume_serial: Some(1),
+            metadata_only: false,
+            content_hash: None,
+            text_embedding: None,
+            doc_text: None,
+            tags: vec![],
+            faces_evaluated: false,
+            ocr_stage_ran: false,
+            doc_stage_ran: false,
+            tags_evaluated: true,
+        }
+    }
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).expect("migrations apply");
+        conn
+    }
+
+    /// Re-ingesting the same path twice produces exactly one row. Guards
+    /// against the ON CONFLICT clause regressing to INSERT OR IGNORE.
+    #[test]
+    fn duplicate_path_resolves_to_single_row() {
+        let conn = in_memory_db();
+        let f = fixture(r"C:\Users\adam\Pictures\IMG_0001.jpg");
+        insert_one(&conn, &f).unwrap();
+        insert_one(&conn, &f).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// `INSERT_FILE_RETURNING_ID_SQL` must yield the row id on BOTH the
+    /// freshly-inserted and ON CONFLICT DO UPDATE branches. The hot-path
+    /// flush relies on this — if RETURNING only fired on insert, every
+    /// repeat-scan row would error with QueryReturnedNoRows. Guards the
+    /// V15.9 redundant-SELECT elimination.
+    #[test]
+    fn insert_returning_id_yields_same_id_on_conflict() {
+        let conn = in_memory_db();
+        let f = fixture(r"C:\Users\adam\Pictures\IMG_RETURNING.jpg");
+        let path_text = f.path.to_string_lossy();
+        let path_hash = crate::util::path_safety::stable_path_hash(&path_text);
+        let extension = f.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+        let bind = |f: &TaggedFile| {
+            let path_text = f.path.to_string_lossy().to_string();
+            (path_text, path_hash, f.size_bytes as i64, None::<f64>,
+             f.modified_unix, f.scanned_unix, f.kind.as_str().to_string(),
+             extension.clone(), f.phash, None::<f64>,
+             f.has_faces as i64, f.has_text as i64,
+             f.camera_model.clone(), f.location_lat, f.location_lon,
+             f.failed as i64, f.error_message.clone(),
+             f.content_hash.as_ref().map(|h| h.to_vec()), f.file_ref.map(|r| r as i64),
+             f.volume_serial.map(i64::from), i64::from(f.metadata_only))
+        };
+        let row = bind(&f);
+        let id1: i64 = conn.query_row(
+            INSERT_FILE_RETURNING_ID_SQL,
+            params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7,
+                    row.8, row.9, row.10, row.11, row.12, row.13, row.14, row.15, row.16,
+                    row.17, row.18, row.0, row.19, row.20, false, false],
+            |r| r.get(0),
+        ).expect("first insert returns id");
+        let id2: i64 = conn.query_row(
+            INSERT_FILE_RETURNING_ID_SQL,
+            params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7,
+                    row.8, row.9, row.10, row.11, row.12, row.13, row.14, row.15, row.16,
+                    row.17, row.18, row.0, row.19, row.20, false, false],
+            |r| r.get(0),
+        ).expect("ON CONFLICT branch must also return id");
+        assert_eq!(id1, id2, "RETURNING must yield stable id across insert + update");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// R3-04: a re-scan whose vision/EXIF stage produced no values (decode
+    /// failed / online-only placeholder / GPU dead) must NOT null out
+    /// previously-computed phash/camera/GPS, nor flip has_faces/has_text off
+    /// while their child rows still exist. COALESCE protects the nullable
+    /// scalars; the ?21/?22 stage-ran gates protect the NOT NULL booleans.
+    #[test]
+    fn stage_skipped_rescan_preserves_prior_metadata() {
+        let conn = in_memory_db();
+        let mut a = fixture(r"C:\lib\IMG_META.jpg");
+        a.phash = Some(0x1234_5678);
+        a.camera_model = Some("Canon".into());
+        a.location_lat = Some(40.0);
+        a.location_lon = Some(-73.0);
+        a.has_faces = true;
+        a.has_text = true;
+        a.faces_evaluated = true;
+        a.ocr_stage_ran = true;
+        insert_one(&conn, &a).unwrap();
+
+        // Re-scan where nothing was produced this session (placeholder / decode
+        // fail / models missing): all metadata NULL/false, no stage ran.
+        let mut b = fixture(r"C:\lib\IMG_META.jpg");
+        b.phash = None;
+        b.camera_model = None;
+        b.location_lat = None;
+        b.location_lon = None;
+        b.has_faces = false;
+        b.has_text = false;
+        b.faces_evaluated = false;
+        b.ocr_stage_ran = false;
+        b.doc_stage_ran = false;
+        insert_one(&conn, &b).unwrap();
+
+        let (phash, cam, lat, lon, hf, ht): (Option<i64>, Option<String>, Option<f64>, Option<f64>, i64, i64) =
+            conn.query_row(
+                "SELECT phash, camera_model, location_lat, location_lon, has_faces, has_text \
+                 FROM files WHERE path_text = ?1",
+                params![r"C:\lib\IMG_META.jpg"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(phash, Some(0x1234_5678), "phash preserved when re-scan produced none");
+        assert_eq!(cam.as_deref(), Some("Canon"), "camera_model preserved");
+        assert_eq!(lat, Some(40.0), "location_lat preserved");
+        assert_eq!(lon, Some(-73.0), "location_lon preserved");
+        assert_eq!(hf, 1, "has_faces not cleared when the faces stage didn't run");
+        assert_eq!(ht, 1, "has_text not cleared when the text stage didn't run");
+
+        // Positive control: a stage that DID run with a fresh value overwrites.
+        let mut c = fixture(r"C:\lib\IMG_META.jpg");
+        c.has_faces = false;
+        c.faces_evaluated = true; // stage ran and found none → must clear
+        insert_one(&conn, &c).unwrap();
+        let hf2: i64 = conn
+            .query_row("SELECT has_faces FROM files WHERE path_text = ?1",
+                       params![r"C:\lib\IMG_META.jpg"], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hf2, 0, "has_faces cleared when the faces stage actually ran and found none");
+    }
+
+    /// ON CONFLICT must UPDATE (not skip) so a rescan with new
+    /// size/modified_at writes them. Guards against INSERT OR IGNORE.
+    #[test]
+    fn duplicate_path_updates_size_and_modified() {
+        let conn = in_memory_db();
+        let mut f = fixture(r"C:\a.jpg");
+        insert_one(&conn, &f).unwrap();
+        f.size_bytes = 9999;
+        f.modified_unix = 1_800_000_000.0;
+        insert_one(&conn, &f).unwrap();
+        let (size, modified): (i64, f64) = conn
+            .query_row(
+                "SELECT size_bytes, modified_at FROM files WHERE path_text = ?1",
+                params![r"C:\a.jpg"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 9999);
+        assert!((modified - 1_800_000_000.0).abs() < 0.5);
+    }
+
+    proptest::proptest! {
+        /// Arbitrary insert mix (with intentional duplicates) → row count
+        /// must equal the number of distinct paths. Both the scan resume
+        /// cursor and the People-tab dedup logic rely on path_text being
+        /// unique.
+        #[test]
+        fn row_count_equals_distinct_paths(
+            // Generate a small set of candidate paths…
+            paths in proptest::collection::vec(r"C:\\test\\[a-z0-9]{1,8}\\f\.jpg", 1..6),
+            // …then sample with repetition to force duplicates.
+            order in proptest::collection::vec(0usize..6, 1..50),
+        ) {
+            let conn = in_memory_db();
+            for idx in &order {
+                let path = &paths[idx % paths.len()];
+                insert_one(&conn, &fixture(path)).unwrap();
+            }
+            let distinct: std::collections::HashSet<&String> = order
+                .iter()
+                .map(|i| &paths[i % paths.len()])
+                .collect();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            proptest::prop_assert_eq!(n as usize, distinct.len());
+        }
+
+        /// Embedding BLOB round-trip must be byte-for-byte lossless and
+        /// little-endian on every host. Reading via f32::from_le_bytes
+        /// matches what the C# app and the macOS engine do; any future
+        /// switch to to_ne_bytes would silently corrupt embeddings when
+        /// the same DB file moves between architectures.
+        ///
+        /// We generate via u32 → f32::from_bits so NaN bit patterns are
+        /// in scope: byte-level round-trip must preserve NaN payloads
+        /// too, even though value equality wouldn't. We compare on bit
+        /// patterns rather than f32 equality for that reason.
+        #[test]
+        fn embedding_le_bytes_round_trip(
+            bits in proptest::collection::vec(proptest::num::u32::ANY, 1..520),
+        ) {
+            let values: Vec<f32> = bits.iter().copied().map(f32::from_bits).collect();
+            let bytes = floats_to_le_bytes(&values);
+            proptest::prop_assert_eq!(bytes.len(), values.len() * 4);
+            let decoded: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            proptest::prop_assert_eq!(decoded.len(), values.len());
+            for (i, (a, b)) in decoded.iter().zip(values.iter()).enumerate() {
+                proptest::prop_assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "mismatch at index {}", i,
+                );
+            }
+        }
+    }
+
+    /// 512-d zero vector → 2048 zero bytes; matches the embedding column
+    /// shape MobileCLIP and ArcFace both produce. Guards against a future
+    /// Vec::with_capacity bug where capacity is allocated but data is not
+    /// written.
+    #[test]
+    fn embedding_le_bytes_zero_vector() {
+        let v = vec![0.0_f32; 512];
+        let bytes = floats_to_le_bytes(&v);
+        assert_eq!(bytes.len(), 2048);
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    // ---- B1 rename-heal data-loss regression --------------------------------
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "fileid_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Mirror of the heal+insert per-file body in `flush`, exercising the
+    /// real HEAL_LOOKUP_SQL / `heal_candidate_moved` / HEAL_UPDATE_SQL /
+    /// INSERT_FILE_RETURNING_ID_SQL so the B1 guard is under test end-to-end.
+    fn ingest_with_heal(conn: &Connection, f: &TaggedFile) -> i64 {
+        let path_text = f.path.to_string_lossy();
+        let path_hash = crate::util::path_safety::stable_path_hash(&path_text);
+        let path_search = nfc_path_search(&path_text);
+        let extension = f
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if f.file_ref.is_some() || f.content_hash.is_some() {
+            let ch_bytes = f.content_hash.as_ref().map(|h| h.as_slice());
+            let legacy_hash = if f.content_hash.is_some()
+                && f.size_bytes > crate::util::content_hash::FULL_HASH_MAX_BYTES
+            {
+                crate::util::content_hash::legacy_content_hash(&f.path, f.size_bytes).ok()
+            } else {
+                None
+            };
+            let healed: Option<(i64, String, bool)> = conn
+                .query_row(
+                    HEAL_LOOKUP_SQL,
+                    params![
+                        f.file_ref.map(|r| r as i64),
+                        ch_bytes,
+                        path_text.as_ref(),
+                        legacy_hash.as_ref().map(|h| h.as_slice()),
+                        f.size_bytes as i64,
+                        f.volume_serial.map(i64::from),
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+                )
+                .optional()
+                .unwrap();
+            if let Some((id, old_path, by_ref)) = healed {
+                if heal_candidate_moved(by_ref, &old_path) {
+                    conn.execute(HEAL_UPDATE_SQL, params![path_text, path_hash, id, path_search])
+                        .unwrap();
+                }
+            }
+        }
+        conn.query_row(
+            INSERT_FILE_RETURNING_ID_SQL,
+            params![
+                path_text,
+                path_hash,
+                f.size_bytes as i64,
+                None::<f64>,
+                f.modified_unix,
+                f.scanned_unix,
+                f.kind.as_str(),
+                extension,
+                f.phash,
+                None::<f64>,
+                f.has_faces as i64,
+                f.has_text as i64,
+                f.camera_model,
+                f.location_lat,
+                f.location_lon,
+                f.failed as i64,
+                f.error_message,
+                f.content_hash.as_ref().map(|h| h.as_slice()),
+                f.file_ref.map(|r| r as i64),
+                path_search,
+                f.volume_serial.map(i64::from),
+                i64::from(f.metadata_only),
+                f.faces_evaluated,
+                f.ocr_stage_ran || f.doc_stage_ran,
+            ],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The `by_ref` flag must be 1 only for a `file_ref` match and 0 (never
+    /// SQL NULL) for a content_hash-only match — even when the incoming
+    /// file_ref is NULL but the matched row has one.
+    #[test]
+    fn heal_lookup_flags_ref_match_but_not_hash_only() {
+        let conn = in_memory_db();
+        let mut a = fixture(r"C:\lib\old\IMG.jpg");
+        a.content_hash = Some([7u8; 32]);
+        a.file_ref = Some(0xABCD);
+        ingest_with_heal(&conn, &a);
+
+        let by_ref: bool = conn
+            .query_row(
+                HEAL_LOOKUP_SQL,
+                params![Some(0xABCDu64), Some([7u8; 32].as_slice()), r"C:\lib\new\IMG.jpg", None::<&[u8]>, 1234i64, 1i64],
+                |r| Ok(r.get::<_, i64>(2)? != 0),
+            )
+            .unwrap();
+        assert!(by_ref, "file_ref match must set by_ref");
+
+        // Incoming file_ref NULL, matched only via content_hash → by_ref = 0,
+        // and crucially not NULL (which would break r.get::<_, i64>).
+        let by_ref_none: bool = conn
+            .query_row(
+                HEAL_LOOKUP_SQL,
+                params![None::<u64>, Some([7u8; 32].as_slice()), r"C:\lib\new\IMG.jpg", None::<&[u8]>, 1234i64, 1i64],
+                |r| Ok(r.get::<_, i64>(2)? != 0),
+            )
+            .unwrap();
+        assert!(!by_ref_none, "content_hash-only match must clear by_ref");
+    }
+
+    /// C4: an over-cap row stamped by a pre-interior-sample build carries the
+    /// recipe-v1 digest. The lookup must match it via the ?4 fallback even
+    /// though the current-recipe digest (?2) differs, or the row never heals.
+    #[test]
+    fn heal_lookup_matches_legacy_recipe_digest_via_fallback() {
+        let conn = in_memory_db();
+        let mut old = fixture(r"C:\lib\old\HUGE.tif");
+        old.content_hash = Some([0x22; 32]); // recipe-v1 digest stamped by main
+        ingest_with_heal(&conn, &old);
+
+        let matched: Option<(i64, bool)> = conn
+            .query_row(
+                HEAL_LOOKUP_SQL,
+                params![
+                    None::<u64>,
+                    Some([0x33u8; 32].as_slice()), // current-recipe digest: no row has it
+                    r"C:\lib\new\HUGE.tif",
+                    Some([0x22u8; 32].as_slice()),
+                    1234i64,
+                    1i64
+                ],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()
+            .unwrap();
+        let (_, by_ref) = matched.expect("legacy digest must match via the ?4 fallback");
+        assert!(!by_ref, "legacy-hash match is a content match, not a ref match");
+    }
+
+    /// B1 core: two byte-identical files that COEXIST (a copy, not a move)
+    /// must each get their own row. Before the fix the second file's
+    /// content_hash heal stole the first's row and dropped it from the
+    /// library.
+    #[test]
+    fn coexisting_byte_identical_copies_stay_distinct_rows() {
+        let dir = unique_tmp_dir("b1_copy");
+        let orig = dir.join("IMG_1558.HEIC");
+        std::fs::write(&orig, b"same-bytes").unwrap();
+        let copy = dir.join("IMG_1558(1).HEIC");
+        std::fs::write(&copy, b"same-bytes").unwrap();
+
+        let conn = in_memory_db();
+        let mut a = fixture(orig.to_str().unwrap());
+        a.content_hash = Some([0x11; 32]);
+        a.file_ref = Some(1001);
+        let id_a = ingest_with_heal(&conn, &a);
+
+        let mut b = fixture(copy.to_str().unwrap());
+        b.content_hash = Some([0x11; 32]); // identical bytes → identical hash
+        b.file_ref = Some(2002); // a DISTINCT on-disk file → distinct MFT ref
+        let id_b = ingest_with_heal(&conn, &b);
+
+        assert_ne!(id_a, id_b, "copy must not steal the original's row");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both coexisting byte-identical files must be catalogued");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B1: a genuine MOVE (content_hash match, old path gone from disk) heals
+    /// to a single row, preserving the row id and its FK-linked tags.
+    #[test]
+    fn genuine_move_heals_and_preserves_fks() {
+        let dir = unique_tmp_dir("b1_move");
+        let new_path = dir.join("moved.jpg");
+        std::fs::write(&new_path, b"payload").unwrap();
+        // Old path is never created on disk → "gone" → a real move.
+        let old_path = dir.join("gone").join("orig.jpg");
+
+        let conn = in_memory_db();
+        let mut a = fixture(old_path.to_str().unwrap());
+        a.content_hash = Some([0x22; 32]);
+        a.file_ref = None; // cross-volume move: only content_hash identity
+        let id_a = ingest_with_heal(&conn, &a);
+        conn.execute(
+            "INSERT INTO tags (file_id, tag, source, score) VALUES (?1, 'cat', 'auto', 0.9)",
+            params![id_a],
+        )
+        .unwrap();
+
+        let mut b = fixture(new_path.to_str().unwrap());
+        b.content_hash = Some([0x22; 32]);
+        b.file_ref = None;
+        let id_b = ingest_with_heal(&conn, &b);
+
+        assert_eq!(id_a, id_b, "a real move must re-bind the SAME row id");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the moved file is one row, not two");
+        let tag_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE file_id = ?1 AND tag = 'cat'",
+                params![id_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_count, 1, "FK-linked tag must survive the heal");
+        let healed_path: String = conn
+            .query_row("SELECT path_text FROM files WHERE id = ?1", params![id_b], |r| r.get(0))
+            .unwrap();
+        assert_eq!(healed_path, new_path.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A true rename detected via file_ref (NTFS MFT id) heals when the old
+    /// path is GONE from disk — a real move always leaves its old path absent.
+    #[test]
+    fn file_ref_rename_with_old_path_gone_heals() {
+        let dir = unique_tmp_dir("b1_ref_rename");
+        let new_path = dir.join("after.png");
+        std::fs::write(&new_path, b"x").unwrap();
+        // Old path is never created on disk → "gone" → a real move.
+        let old_path = dir.join("gone").join("before.png");
+
+        let conn = in_memory_db();
+        let mut a = fixture(old_path.to_str().unwrap());
+        a.file_ref = Some(0xDEAD_BEEF);
+        let id_a = ingest_with_heal(&conn, &a);
+
+        let mut b = fixture(new_path.to_str().unwrap());
+        b.file_ref = Some(0xDEAD_BEEF); // same MFT ref + old path gone → rename
+        let id_b = ingest_with_heal(&conn, &b);
+
+        assert_eq!(id_a, id_b, "file_ref match with old path gone is a rename → heal");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-volume / hardlink safety: a file_ref match while the OLD path is
+    /// STILL present on disk is NOT a rename. The NTFS MFT reference is only
+    /// volume-local, so two distinct files on different volumes (or two
+    /// hardlinks to one file) can collide on the same ref. Healing such a
+    /// collision would re-bind one file's row to the other's path and, via
+    /// UPDATE OR REPLACE, FK-cascade the loser's tags/faces away — silent data
+    /// loss. The old-path-gone gate keeps them as two distinct rows.
+    #[test]
+    fn file_ref_collision_with_both_paths_present_stays_distinct() {
+        let dir = unique_tmp_dir("b1_ref_collision");
+        let old_path = dir.join("before.png");
+        std::fs::write(&old_path, b"x").unwrap(); // old path STILL present
+        let new_path = dir.join("after.png");
+        std::fs::write(&new_path, b"y").unwrap(); // a DISTINCT coexisting file
+
+        let conn = in_memory_db();
+        let mut a = fixture(old_path.to_str().unwrap());
+        a.file_ref = Some(0xDEAD_BEEF);
+        let id_a = ingest_with_heal(&conn, &a);
+
+        let mut b = fixture(new_path.to_str().unwrap());
+        b.file_ref = Some(0xDEAD_BEEF); // colliding ref, but old file still exists
+        let id_b = ingest_with_heal(&conn, &b);
+
+        assert_ne!(id_a, id_b, "a colliding ref with the old file present must not collapse");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "two coexisting files must stay distinct rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3-17: a file_ref match while the old path is GONE but the candidate
+    /// row's size DIFFERS is NOT a genuine move. An NTFS MFT reference is only
+    /// volume-local, so a cross-volume collision (or a reused ref) whose old
+    /// path happens to be absent must not re-bind an unrelated file's row and
+    /// FK-cascade its tags/faces onto a different file. The size_bytes
+    /// corroboration on the file_ref heal arm blocks it; a true rename (same
+    /// size) still heals (see file_ref_rename_with_old_path_gone_heals).
+    #[test]
+    fn file_ref_heal_requires_matching_size() {
+        let dir = unique_tmp_dir("r3_17_size");
+        let new_path = dir.join("after.png");
+        std::fs::write(&new_path, b"x").unwrap();
+        // Old path never created on disk → "gone" → would heal if size matched.
+        let old_path = dir.join("gone").join("before.png");
+
+        let conn = in_memory_db();
+        let mut a = fixture(old_path.to_str().unwrap());
+        a.file_ref = Some(0xC0FF_EE00);
+        a.size_bytes = 1000; // original file's size
+        let id_a = ingest_with_heal(&conn, &a);
+
+        let mut b = fixture(new_path.to_str().unwrap());
+        b.file_ref = Some(0xC0FF_EE00); // same ref, old path gone …
+        b.size_bytes = 2000; // … but a different size → a different file
+        let id_b = ingest_with_heal(&conn, &b);
+
+        assert_ne!(id_a, id_b, "same ref + old path gone but different size must not heal");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "the size mismatch keeps them as two distinct rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ENG-18: an NTFS `file_ref` with the high bit set (a non-zero sequence
+    /// number lives in the top 16 bits) exceeds `i64::MAX`. rusqlite's
+    /// `ToSql for u64` rejects values above `i64::MAX`, so binding the raw u64
+    /// errored and the `?` aborted the entire flush batch — losing the whole
+    /// catalog. We now bitcast `u64 -> i64` losslessly at every bind site; the
+    /// insert must succeed and the value must still round-trip through the
+    /// heal lookup (same MFT ref → rename → heal, not a duplicate row).
+    #[test]
+    fn high_bit_file_ref_does_not_abort_insert() {
+        let dir = unique_tmp_dir("eng18_ref");
+        let hi: u64 = 0xFFFF_0000_0000_0001; // > i64::MAX
+        assert!(hi > i64::MAX as u64, "fixture must exercise the high-bit path");
+
+        let conn = in_memory_db();
+        let mut a = fixture(dir.join("a.png").to_str().unwrap());
+        a.file_ref = Some(hi);
+        let id_a = ingest_with_heal(&conn, &a); // must NOT error on the u64 bind
+
+        let mut b = fixture(dir.join("b.png").to_str().unwrap());
+        b.file_ref = Some(hi); // same MFT ref at a new path → a true rename
+        let id_b = ingest_with_heal(&conn, &b);
+
+        assert_eq!(id_a, id_b, "high-bit file_ref must round-trip and heal");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "rename must not create a duplicate row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C12: the v15 sync triggers own ocr_fts/doc_fts; the writer only
+    /// touches the content tables (explicit DELETE + INSERT — the flush
+    /// pattern). FTS must follow through insert → re-process (delete+insert)
+    /// → direct update → delete with no stale postings and no corruption.
+    /// Before the fix the writer's manual FTS statements double-fired against
+    /// a macOS-installed trigger set → SQLITE_CORRUPT on every re-process.
+    #[test]
+    fn fts_follows_content_tables_via_triggers() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO files (path_text, path_hash, size_bytes, scanned_at, kind, extension) \
+             VALUES ('C:\\t\\a.png', 1, 1, 1.0, 'image', 'png')",
+            [],
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path_text = 'C:\\t\\a.png'", [], |r| r.get(0))
+            .unwrap();
+
+        let hits = |term: &str, fts: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {fts} WHERE {fts} MATCH ?1"),
+                params![term],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let integrity_ok = |fts: &str| {
+            conn.execute(
+                &format!("INSERT INTO {fts}({fts}, rank) VALUES('integrity-check', 1)"),
+                [],
+            )
+            .map(|_| ())
+        };
+
+        for (content, fts) in [("ocr_text", "ocr_fts"), ("doc_text", "doc_fts")] {
+            conn.execute(
+                &format!("INSERT INTO {content} (file_id, text) VALUES (?1, 'alpha bravo')"),
+                params![id],
+            )
+            .unwrap();
+            assert_eq!(hits("alpha", fts), 1, "{fts}: insert must be indexed by the ai trigger");
+
+            conn.execute(&format!("DELETE FROM {content} WHERE file_id = ?1"), params![id])
+                .unwrap();
+            conn.execute(
+                &format!("INSERT INTO {content} (file_id, text) VALUES (?1, 'charlie delta')"),
+                params![id],
+            )
+            .unwrap();
+            assert_eq!(hits("alpha", fts), 0, "{fts}: re-process must drop stale postings");
+            assert_eq!(hits("charlie", fts), 1, "{fts}: re-process must index fresh text");
+
+            conn.execute(
+                &format!("UPDATE {content} SET text = 'echo foxtrot' WHERE file_id = ?1"),
+                params![id],
+            )
+            .unwrap();
+            assert_eq!(hits("charlie", fts), 0, "{fts}: au trigger must drop old postings");
+            assert_eq!(hits("echo", fts), 1, "{fts}: au trigger must index new text");
+
+            conn.execute(&format!("DELETE FROM {content} WHERE file_id = ?1"), params![id])
+                .unwrap();
+            assert_eq!(hits("echo", fts), 0, "{fts}: ad trigger must clear postings");
+
+            integrity_ok(fts).unwrap_or_else(|e| panic!("{fts} integrity-check failed: {e}"));
+        }
+    }
+
+    /// C15: every writer path stamps `path_search` (= `path_text` on
+    /// Windows — see the v16 migration note) so the app's normalization-
+    /// insensitive LIKE never misses engine-written rows.
+    #[test]
+    fn writers_populate_path_search() {
+        let conn = in_memory_db();
+        let f = fixture(r"C:\lib\café.jpg");
+        insert_one(&conn, &f).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT path_search FROM files WHERE path_text = ?1",
+                params![r"C:\lib\café.jpg"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, r"C:\lib\café.jpg");
+
+        let id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path_text = ?1", params![r"C:\lib\café.jpg"], |r| r.get(0))
+            .unwrap();
+        let new_path = r"C:\lib\renamed.jpg";
+        conn.execute(
+            HEAL_UPDATE_SQL,
+            params![new_path, 42i64, id, nfc_path_search(new_path)],
+        )
+        .unwrap();
+        let healed: String = conn
+            .query_row("SELECT path_search FROM files WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(healed, r"C:\lib\renamed.jpg", "heal must re-stamp path_search");
+    }
+
+    // F-C2-005: an NFD filename (decomposed — base letter + combining mark,
+    // the on-disk form for Mac/NAS/Dropbox-synced names) must be stored as
+    // NFC in path_search so the app's NFC query (LIKE) finds it. Before the
+    // write-side normalization the engine stored the verbatim NFD bytes, which
+    // an NFC query could never match.
+    #[test]
+    fn nfd_filename_is_searchable_by_nfc_query() {
+        // "cafe\u{0301}" is NFD: ASCII 'e' + COMBINING ACUTE ACCENT (U+0301).
+        let nfd_path = "C:\\lib\\cafe\u{0301}.jpg";
+        // "café" is NFC: precomposed 'é' (U+00E9) — what a search field yields.
+        let nfc_query = "%caf\u{00E9}.jpg";
+
+        // Sanity: the two byte-strings genuinely differ pre-normalization.
+        assert_ne!(nfd_path, "C:\\lib\\caf\u{00E9}.jpg",
+            "test vector must actually be NFD, not NFC");
+
+        let conn = in_memory_db();
+        let f = fixture(nfd_path);
+        insert_one(&conn, &f).unwrap();
+
+        // path_text keeps the verbatim (NFD) bytes; path_search is NFC.
+        let (stored_text, stored_search): (String, String) = conn
+            .query_row(
+                "SELECT path_text, path_search FROM files LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_text, nfd_path, "path_text stays verbatim");
+        assert_eq!(stored_search, "C:\\lib\\caf\u{00E9}.jpg",
+            "path_search must be NFC-composed");
+
+        // The NFC query finds the row only via the NFC path_search column.
+        let found_via_search: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path_search LIKE ?1",
+                params![nfc_query],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found_via_search, 1,
+            "NFC query must match the NFC-normalized path_search");
+
+        // Control: the same NFC query against verbatim path_text would miss
+        // (this is the bug the column fixes).
+        let found_via_text: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path_text LIKE ?1",
+                params![nfc_query],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found_via_text, 0,
+            "NFC query cannot match verbatim NFD path_text — why path_search exists");
+    }
+
+    #[test]
+    fn nfc_path_search_is_identity_on_ascii() {
+        let p = r"C:\Users\me\Pictures\vacation_2024.jpg";
+        assert_eq!(nfc_path_search(p), p, "ASCII paths must not be altered");
+    }
+
+    // F-C1-025: the recipe-v1 (legacy) content-hash re-read for an over-cap
+    // (>16 MB) file is a ~2 MB blocking disk read. It must be computed BEFORE
+    // the writer lock (into `legacy_hashes`), never inside the single-writer
+    // transaction. This test drives the real `flush`: it seeds a row stamped
+    // with the legacy digest of an over-cap temp file at a now-gone path, then
+    // flushes the same content at a new path. The heal can only fire if `flush`
+    // read the legacy digest off disk and matched it via the `?4` fallback —
+    // exercising the hoisted (pre-lock) read path end-to-end.
+    #[test]
+    fn over_cap_legacy_hash_heal_runs_via_prelock_read() {
+        let dir = unique_tmp_dir("overcap_legacy");
+        let over_cap_bytes = crate::util::content_hash::FULL_HASH_MAX_BYTES + 4096;
+        let new_path = dir.join("moved_here.bin");
+        // Distinct, non-trivial byte pattern so head/tail samples are stable.
+        let mut content = vec![0u8; over_cap_bytes as usize];
+        for (i, b) in content.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&new_path, &content).unwrap();
+
+        // The recipe-v1 digest the decoder thread would NOT have stamped (the
+        // current recipe adds interior samples) — `flush` reproduces it by
+        // re-reading head+tail+size, which is the read we hoisted off the lock.
+        let legacy_digest =
+            crate::util::content_hash::legacy_content_hash(&new_path, over_cap_bytes).unwrap();
+
+        let conn = Arc::new(Mutex::new(in_memory_db()));
+
+        // Seed the prior row at a path that no longer exists on disk (genuine
+        // move) carrying the legacy digest as its content_hash.
+        let old_path = dir.join("was_here.bin"); // never written → gone from disk
+        {
+            let c = conn.lock();
+            let mut seed = fixture(old_path.to_str().unwrap());
+            seed.size_bytes = over_cap_bytes;
+            seed.kind = FileKind::Other;
+            seed.content_hash = Some(legacy_digest);
+            insert_one(&c, &seed).unwrap();
+        }
+
+        // Incoming file at the NEW path: a DIFFERENT (current-recipe) digest in
+        // ?2 so the heal can only match through the legacy ?4 fallback.
+        let mut incoming = fixture(new_path.to_str().unwrap());
+        incoming.size_bytes = over_cap_bytes;
+        incoming.kind = FileKind::Other;
+        incoming.content_hash = Some([0xABu8; 32]);
+
+        let writer = DbWriter::new(conn.clone(), ScanCoordinator::new());
+        let mut buffer = vec![incoming];
+        let mut total = 0u64;
+        let mut failed = 0u64;
+        writer.flush(&mut buffer, &mut total, &mut failed, 0).unwrap();
+
+        // Exactly one row, re-bound to the new path — proves the legacy digest
+        // was read (pre-lock) and consumed by the heal.
+        let c = conn.lock();
+        let row_count: i64 = c
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1, "heal must re-bind the prior row, not add a second");
+        let healed_path: String = c
+            .query_row("SELECT path_text FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            healed_path,
+            new_path.to_string_lossy(),
+            "over-cap row must heal to the new path via the legacy-digest fallback"
+        );
+
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

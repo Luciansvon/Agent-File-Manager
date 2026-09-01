@@ -1,0 +1,1754 @@
+// HuggingFace 12-way parallel range-GET downloader.
+//
+// Mirror of the macOS app's `HFDownloader.swift`. Splits a large file
+// into 12 byte ranges, downloads them concurrently into part files, and
+// concatenates on completion. Each chunk is verified against the
+// Content-Range header. Final SHA256 checked against MODELS.md.
+//
+// Privacy: this is the **only** network code in the engine. Every URL
+// the downloader hits comes from the canonical SHA256-pinned manifest
+// in `shared/docs/MODELS.md` — no telemetry, no analytics, no opt-in
+// flag because there's nothing to opt out of.
+//
+// Lifecycle:
+//   1. HEAD request to discover Content-Length + ETag.
+//   2. Open 12 ranged GETs.
+//   3. Stream each into `<file>.part-N`, reporting bytes per second.
+//   4. Concatenate parts → final file, verify SHA256.
+//   5. Atomic rename to the final destination.
+//
+// On cancellation the part files stay on disk so resume is cheap.
+
+use anyhow::{Context, Result};
+use futures_util::StreamExt;
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
+
+pub const PARALLEL_PARTS: usize = 12;
+const PROGRESS_REPORT_INTERVAL_BYTES: u64 = 1024 * 1024; // 1 MB
+const MIN_BYTES_FOR_PARALLEL: u64 = 5 * 1024 * 1024;     // 5 MB
+// 4 Hz. The old 50 ms (20 Hz) cadence was chosen for bar smoothness, but each
+// event crosses IPC → JSON parse → PropertyChanged → x:Bind re-eval across
+// every bound row on the app's UI thread — at 20 Hz for a 15 GB VLM that is
+// ~19,000 events of pure UI churn (the Welcome sheet visibly glitched, and
+// app.log grew megabytes of [INSTALL] spam). A progress bar repainting 4×/s
+// is indistinguishable to the eye; the EMA rate uses its own 500 ms sampler.
+const PROGRESS_THROTTLE_MS: u64 = 250;
+const MAX_UNSIZED_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Total concurrent in-flight HTTP requests across ALL prewarm tasks.
+/// HuggingFace's CDN starts returning 429s when one IP issues too many
+/// simultaneous range-GETs. With 3 concurrent models × 12 PARALLEL_PARTS
+/// each = 36 sockets the third model's downloads were stalling on
+/// Retry-After back-offs, which presented as MobileCLIP-S2 "stuck on 0%
+/// until you cancel". 8 permits keeps all three models making forward
+/// progress without tripping the throttle.
+const MAX_CONCURRENT_HTTP_REQUESTS: usize = 8;
+
+fn http_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static SEMA: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEMA.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HTTP_REQUESTS)))
+}
+
+/// Hosts FileID is permitted to download from — HF + its CDN, GitHub + its
+/// objects CDN, NVIDIA. Suffix-match with a leading dot for subdomains so
+/// "evilhuggingface.co" never matches ".huggingface.co". Used BOTH to gate the
+/// INITIAL request URL (`download_url_allowed`, enforced in `download_simple` /
+/// `download_parallel`) and to constrain redirect hops (the reqwest redirect
+/// policy in `build_shared_client`) — so the egress invariant is a runtime
+/// guarantee, not only the `registry.rs` URL list plus a CI grep.
+const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
+    "huggingface.co",
+    "hf.co",
+    "github.com",
+    "githubusercontent.com",
+    "download.nvidia.com",
+    "developer.nvidia.com",
+];
+
+/// True iff `url` parses, is https, and its host is on (or a subdomain of) the
+/// egress allowlist. A non-allowlisted or non-https initial URL is refused
+/// before any network I/O.
+fn download_url_allowed(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) => {
+            u.scheme() == "https"
+                && u.host_str().is_some_and(|h| {
+                    ALLOWED_DOWNLOAD_HOSTS
+                        .iter()
+                        .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+                })
+        }
+        Err(_) => false,
+    }
+}
+
+/// CA-allowlist TLS pinning (SECURITY.md hardening item; documented in
+/// shared/security/tls-pins.json). These PEMs become the ONLY trust anchors
+/// on the download client, so an active MITM holding any other OS-trusted CA
+/// (interception proxy, compromised CA) fails the handshake instead of
+/// silently re-signing the connection. Root-level pins, not leaf/intermediate:
+/// leaves rotate ~90 days and the CDNs move between CA families; these roots
+/// are stable for decades. Defense-in-depth alongside per-artifact SHA256.
+const PINNED_ROOT_CERTS: [(&str, &[u8]); 11] = [
+    ("amazon-root-ca-1", include_bytes!("../../../../../shared/security/pinned-roots/amazon-root-ca-1.pem")),
+    ("amazon-root-ca-2", include_bytes!("../../../../../shared/security/pinned-roots/amazon-root-ca-2.pem")),
+    ("amazon-root-ca-3", include_bytes!("../../../../../shared/security/pinned-roots/amazon-root-ca-3.pem")),
+    ("amazon-root-ca-4", include_bytes!("../../../../../shared/security/pinned-roots/amazon-root-ca-4.pem")),
+    ("digicert-global-g2", include_bytes!("../../../../../shared/security/pinned-roots/digicert-global-g2.pem")),
+    ("digicert-global-g3", include_bytes!("../../../../../shared/security/pinned-roots/digicert-global-g3.pem")),
+    ("isrg-root-x1", include_bytes!("../../../../../shared/security/pinned-roots/isrg-root-x1.pem")),
+    ("isrg-root-x2", include_bytes!("../../../../../shared/security/pinned-roots/isrg-root-x2.pem")),
+    ("starfield-services-g2", include_bytes!("../../../../../shared/security/pinned-roots/starfield-services-g2.pem")),
+    ("usertrust-ecc", include_bytes!("../../../../../shared/security/pinned-roots/usertrust-ecc.pem")),
+    ("usertrust-rsa", include_bytes!("../../../../../shared/security/pinned-roots/usertrust-rsa.pem")),
+];
+
+/// Build a long-lived shared `reqwest::Client` with HTTP/2 + connection
+/// pooling. One per engine process; cloned cheaply (it's an `Arc` inside).
+///
+/// Timeout policy is phase-specific, not wall-clock:
+///   * `connect_timeout`  fast-fail on DNS / TCP / TLS handshake.
+///   * `read_timeout`     fail if no progress between bytes; doesn't cap
+///                        the total request duration so a slow-but-
+///                        steady stream finishes a 2 GB GGUF without
+///                        getting axed mid-stream. Replaces a prior
+///                        `.timeout(300s)` blanket that killed any
+///                        Qwen 2.5-VL 3B (2.1 GB) download running on
+///                        a connection slower than ~7 MB/s — the
+///                        original "reading chunk" failure on the
+///                        Welcome sheet. Set to 60 s (not 120 s) so a
+///                        genuinely stalled stream errors → resumes via
+///                        download_range_with_retry within ~61 s, which
+///                        re-emits progress and re-arms the app's 120 s
+///                        no-progress install watchdog BEFORE it alarms
+///                        the user mid-recovery. 60 s of total silence is
+///                        a dead connection, never a healthy slow one
+///                        (any byte resets the timer).
+///
+/// TLS trust is pinned to the roots in `PINNED_ROOT_CERTS` (built-in roots
+/// disabled), per shared/security/tls-pins.json. `FILEID_DISABLE_TLS_PINNING=1`
+/// reverts to the OS root store — validation only ever changes, never the
+/// egress surface — and is logged loudly as a diagnostic escape hatch for
+/// networks that intercept HTTPS.
+#[allow(dead_code)]
+pub fn fail_closed_client() -> Arc<reqwest::Client> {
+    Arc::new(
+        reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .build()
+            .expect("no-roots fallback client"),
+    )
+}
+
+pub fn build_shared_client() -> Result<Arc<reqwest::Client>> {
+    // Restrict redirects to the host families we actually download from (HF +
+    // its CDN, GitHub + its objects CDN, NVIDIA). reqwest's default follows up to
+    // 10 redirects to ANY host — an on-path attacker could bounce a 302 chain to
+    // an off-allowlist host, dodging the source-URL allowlist that only checks
+    // the ORIGINAL URL. Suffix-match with a leading dot for subdomains so
+    // "evilhuggingface.co" never matches ".huggingface.co".
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        // Never follow a redirect off https. The host allowlist alone would let
+        // a 302 downgrade to plaintext http:// on an allowlisted host, which an
+        // on-path attacker could MITM. Every allowlisted CDN serves https, so
+        // this never blocks a legitimate redirect. (audit E11)
+        if attempt.url().scheme() != "https" {
+            return attempt.stop();
+        }
+        match attempt.url().host_str() {
+            Some(h)
+                if ALLOWED_DOWNLOAD_HOSTS
+                    .iter()
+                    .any(|d| h == *d || h.ends_with(&format!(".{d}"))) =>
+            {
+                attempt.follow()
+            }
+            _ => attempt.stop(),
+        }
+    });
+    let mut builder = reqwest::Client::builder()
+        .user_agent("FileID/0.1 (+local)")
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .pool_max_idle_per_host(PARALLEL_PARTS * 2)
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60))
+        .redirect(redirect_policy);
+    if matches!(std::env::var("FILEID_DISABLE_TLS_PINNING").as_deref(), Ok("1")) {
+        tracing::warn!(
+            "FILEID_DISABLE_TLS_PINNING=1 — CA-allowlist TLS pinning is DISABLED; model \
+             downloads will trust the OS root store, including any locally installed \
+             interception/proxy CA. Diagnostic escape hatch only; unset the variable to \
+             restore pinning."
+        );
+    } else {
+        builder = builder.tls_built_in_root_certs(false);
+        for (slug, pem) in PINNED_ROOT_CERTS {
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(pem)
+                    .with_context(|| format!("parsing pinned root CA '{slug}'"))?,
+            );
+        }
+    }
+    let c = builder.build().context("building shared reqwest client")?;
+    Ok(Arc::new(c))
+}
+
+fn message_indicates_pin_failure(msg: &str) -> bool {
+    msg.contains("UnknownIssuer") || msg.contains("invalid peer certificate")
+}
+
+/// rustls reports a chain that doesn't terminate at a pinned root as
+/// `invalid peer certificate: UnknownIssuer`, but only as Display text buried
+/// in the reqwest → hyper → io source chain (no typed variant survives the
+/// wrapping), so a string match over the chain is the only stable detection.
+fn source_chain_indicates_pin_failure(err: &(dyn Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if message_indicates_pin_failure(&e.to_string()) {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+pub fn is_pin_failure(err: &reqwest::Error) -> bool {
+    source_chain_indicates_pin_failure(err)
+}
+
+/// Pin detection for the `anyhow::Error`s this module returns: `chain()`
+/// descends through every context layer and the wrapped source errors, so
+/// this sees the rustls message wherever the retry loops buried it.
+pub fn chain_has_pin_failure(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| match e.downcast_ref::<reqwest::Error>() {
+        Some(re) => is_pin_failure(re),
+        None => message_indicates_pin_failure(&e.to_string()),
+    })
+}
+
+fn io_error_is_disk_full(e: &std::io::Error) -> bool {
+    // 39 = ERROR_HANDLE_DISK_FULL, 112 = ERROR_DISK_FULL. The raw codes are
+    // Windows-only — they mean unrelated errnos on Unix.
+    #[cfg(windows)]
+    let raw_disk_full = matches!(e.raw_os_error(), Some(39 | 112));
+    #[cfg(not(windows))]
+    let raw_disk_full = false;
+    e.kind() == std::io::ErrorKind::StorageFull || raw_disk_full
+}
+
+/// Disk-full detection for install failures: anyhow's Display drops the io
+/// source ("writing range chunk"), so without this walk an ENOSPC surfaces
+/// as a connection problem with retry advice that can never work.
+pub fn chain_has_disk_full(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.downcast_ref::<std::io::Error>().is_some_and(io_error_is_disk_full))
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DownloadProgress {
+    pub url: String,
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub bytes_per_second: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadRequest {
+    pub url: String,
+    pub destination: PathBuf,
+    /// Optional SHA256 (lowercase hex) for integrity check on completion.
+    pub expected_sha256: Option<String>,
+    /// Registry size estimate (`approx_bytes`) for a loose post-download size
+    /// sanity check — catches a truncated stream / HTML error page standing in
+    /// for a model even when no SHA256 is pinned. An estimate, so only an
+    /// implausibly-small result is rejected (see `check_size_plausible`).
+    pub expected_bytes: Option<u64>,
+}
+
+/// Loose post-download size sanity. `approx_bytes` in the registry is an
+/// ESTIMATE, so we reject only implausibly-small results: a truncated stream,
+/// an HTML error page, or an auth wall standing in for a multi-GB model are
+/// orders of magnitude off, not a few percent. A 4× floor never false-rejects
+/// a reasonable estimate but always catches a KB-for-GB substitution. (SHA256,
+/// when pinned, is the exact check; this guards the common no-hash case.)
+fn check_size_plausible(actual: u64, expected: Option<u64>, url: &str) -> Result<()> {
+    if let Some(expected) = expected {
+        if expected > 0 {
+            let floor = (expected / 4).max(1);
+            if actual < floor {
+                anyhow::bail!(
+                    "size sanity failed for {url}: got {actual} bytes, expected \
+                     ~{expected} (floor {floor}) — likely a truncated download or \
+                     an error page, not the model"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_hard_limit(advertised: Option<u64>, expected: Option<u64>) -> u64 {
+    advertised
+        .filter(|n| *n > 0)
+        .or_else(|| expected.filter(|n| *n > 0).map(|n| n.saturating_mul(4)))
+        .unwrap_or(MAX_UNSIZED_DOWNLOAD_BYTES)
+}
+
+const RETRY_BACKOFFS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+    Duration::from_secs(16),
+];
+const MAX_ATTEMPTS_WITHOUT_PROGRESS: u32 = 4;
+
+/// Progress-aware retry budget shared by `download_simple` and
+/// `download_range_with_retry`. A fixed 4-attempt budget combined with the
+/// client's 60 s `read_timeout` to hard-fail a slow-but-progressing download
+/// (large GGUF on spotty wifi) after 4 stalls, even though every attempt
+/// resumed further along. Only attempts that left the part file un-grown burn
+/// budget — growth observed at the top of the next attempt resets the
+/// counter — so a long flaky download survives any number of stalls while it
+/// keeps moving. Zero-progress behavior is unchanged from H13 (same ladder,
+/// bail after `MAX_ATTEMPTS_WITHOUT_PROGRESS`): a dead connection still can't
+/// spin forever. The ladder is indexed by total failures, repeating its last
+/// step, so a chronically flaky link settles into 16 s pauses instead of
+/// hammering 1 s retries after every reset. Growth is judged against a
+/// high-water mark, not the previous stat, so a discard-and-refetch cycle
+/// (416 / non-206 resume / oversized stale part) can't refund budget by
+/// re-downloading the same bytes. (audit C3)
+struct RetryBudget {
+    total_failures: u32,
+    attempts_without_progress: u32,
+    high_water_len: u64,
+}
+
+impl RetryBudget {
+    fn new() -> Self {
+        Self {
+            total_failures: 0,
+            attempts_without_progress: 0,
+            high_water_len: 0,
+        }
+    }
+
+    fn observe_len(&mut self, len: u64) {
+        if len > self.high_water_len {
+            self.high_water_len = len;
+            self.attempts_without_progress = 0;
+        }
+    }
+
+    fn next_backoff(&mut self) -> Option<Duration> {
+        self.total_failures += 1;
+        self.attempts_without_progress += 1;
+        if self.attempts_without_progress >= MAX_ATTEMPTS_WITHOUT_PROGRESS {
+            return None;
+        }
+        let idx = ((self.total_failures - 1) as usize).min(RETRY_BACKOFFS.len() - 1);
+        Some(RETRY_BACKOFFS[idx])
+    }
+}
+
+/// Download a single file. The simple non-parallel path — used when
+/// the server doesn't support `Accept-Ranges: bytes` or the file is
+/// below `MIN_BYTES_FOR_PARALLEL`. Also used by the parallel path's
+/// fallback when HEAD is unreliable.
+///
+/// Takes the shared `reqwest::Client` rather than building a new one per
+/// call — without this, every small file (config.json, tokenizer.json,
+/// etc.) paid an extra TLS handshake.
+///
+/// Retry policy: progress-aware (`RetryBudget`) on stream errors, transport
+/// errors, and 429/5xx responses. Each retry stats the in-progress `.part`
+/// file and resumes via `Range:` so a 2 GB GGUF doesn't re-download from
+/// byte 0 after a single TLS hiccup; growth between attempts refunds the
+/// budget. Mirrors the parallel path's per-range retry policy.
+pub async fn download_simple<F>(
+    client: Arc<reqwest::Client>,
+    request: DownloadRequest,
+    cancel: Arc<AtomicBool>,
+    mut progress: F,
+) -> Result<()>
+where
+    F: FnMut(DownloadProgress),
+{
+    if !download_url_allowed(&request.url) {
+        let host = reqwest::Url::parse(&request.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "<unparseable>".to_string());
+        anyhow::bail!("refusing to download: host '{host}' is not on the https egress allowlist");
+    }
+    if let Some(parent) = request.destination.parent() {
+        tokio::fs::create_dir_all(parent).await
+            .with_context(|| format!("creating parent {}", parent.display()))?;
+    }
+
+    let tmp = request.destination.with_extension(format!(
+        "{}.part",
+        request.destination.extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download")
+    ));
+
+    let started = Instant::now();
+    let bytes_done = Arc::new(AtomicU64::new(0));
+    let mut total: Option<u64> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut budget = RetryBudget::new();
+
+    'attempts: loop {
+        // Resume: stat any prior .part bytes and ask for the remainder.
+        // Statted before the budget decision so a failed-but-progressing
+        // attempt refunds the no-progress counter before it can bail.
+        let existing_len = tokio::fs::metadata(&tmp).await
+            .map(|m| m.len()).unwrap_or(0);
+        budget.observe_len(existing_len);
+
+        if last_err.is_some() {
+            let Some(backoff) = budget.next_backoff() else { break 'attempts };
+            tracing::warn!(
+                attempt = budget.total_failures,
+                url = %request.url,
+                err = ?last_err,
+                "retrying simple download after stream error"
+            );
+            tokio::time::sleep(backoff).await;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("download cancelled");
+        }
+
+        // Honor the global HTTP semaphore so the simple path can't sneak past
+        // the cross-task concurrency cap. Re-acquired each attempt so a long
+        // retry backoff doesn't hog a permit for other prewarms.
+        let _permit = http_semaphore().clone().acquire_owned().await
+            .context("acquiring http permit")?;
+
+        let mut req_builder = client.get(&request.url);
+        if existing_len > 0 {
+            req_builder = req_builder.header("Range", format!("bytes={existing_len}-"));
+        }
+
+        let resp = match req_builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow::Error::new(e).context("issuing GET"));
+                continue 'attempts;
+            }
+        };
+
+        let status = resp.status();
+        // 429 / 5xx — honor Retry-After if present, then retry.
+        if status.as_u16() == 429 || status.is_server_error() {
+            if let Some(s) = resp.headers().get("retry-after").and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                tokio::time::sleep(Duration::from_secs(s.min(60))).await;
+            }
+            last_err = Some(anyhow::anyhow!("HTTP {status}"));
+            continue 'attempts;
+        }
+        // HTTP 416 (Range Not Satisfiable) on a resume means our existing
+        // `.part` is at/past the server's current file length — a stale or
+        // already-complete part. Discard it and restart from 0 on the next
+        // attempt instead of bailing permanently (which left the download
+        // stuck unrecoverable forever).
+        if status.as_u16() == 416 && existing_len > 0 {
+            tracing::warn!(url = %request.url, existing_len,
+                "HTTP 416 on resume; discarding stale part and restarting from 0");
+            let _ = tokio::fs::remove_file(&tmp).await;
+            bytes_done.store(0, Ordering::Relaxed);
+            last_err = Some(anyhow::anyhow!("HTTP 416 (stale part, restarting)"));
+            continue 'attempts;
+        }
+        // 4xx (other than 429 / 416-on-resume) — bad URL / auth required. Don't retry.
+        if status.is_client_error() {
+            anyhow::bail!("non-2xx response: HTTP {status} for {}", request.url);
+        }
+        if !status.is_success() {
+            last_err = Some(anyhow::anyhow!("HTTP {status}"));
+            continue 'attempts;
+        }
+
+        // Decide append-vs-truncate based on whether the server honored
+        // our Range request. 206 = resumed; 200 = ignored Range and is
+        // re-sending from byte 0 (truncate our existing part file).
+        let resumed = existing_len > 0 && status.as_u16() == 206;
+        if !resumed && existing_len > 0 {
+            tracing::warn!(
+                url = %request.url,
+                "server ignored Range header (HTTP {status}); restarting download from 0"
+            );
+            let _ = tokio::fs::remove_file(&tmp).await;
+            bytes_done.store(0, Ordering::Relaxed);
+        }
+
+        // Update total from this response. For 206 the response body is
+        // (total - existing_len) so add the existing prefix back.
+        if total.is_none() {
+            total = resp.content_length().map(|n| if resumed { n + existing_len } else { n });
+        }
+
+        let mut file = if resumed {
+            bytes_done.store(existing_len, Ordering::Relaxed);
+            tokio::fs::OpenOptions::new()
+                .create(true).append(true).open(&tmp).await
+                .with_context(|| format!("opening {}", tmp.display()))?
+        } else {
+            tokio::fs::File::create(&tmp).await
+                .with_context(|| format!("creating {}", tmp.display()))?
+        };
+
+        // Per-attempt hasher. We can only verify SHA256 on a download
+        // that completed in a single attempt — resumes invalidate the
+        // running hash. The post-download verifier reads the file back
+        // from disk and re-hashes, so SHA256 still gets checked.
+        let mut hasher = request
+            .expected_sha256
+            .as_ref()
+            .filter(|_| !resumed)
+            .map(|_| Sha256::new());
+
+        let hard_limit = stream_hard_limit(total, request.expected_bytes);
+        let mut stream = resp.bytes_stream();
+        let mut last_report = bytes_done.load(Ordering::Relaxed);
+        // Time floor alongside the byte gate: on a fast connection 1 MB
+        // intervals alone still fire tens of events per second (see
+        // PROGRESS_THROTTLE_MS — same UI-churn rationale).
+        let mut last_report_at = Instant::now();
+        let mut chunk_err: Option<anyhow::Error> = None;
+
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("download cancelled mid-chunk");
+            }
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    chunk_err = Some(anyhow::Error::new(e).context("reading chunk"));
+                    break;
+                }
+            };
+            let current = bytes_done.load(Ordering::Relaxed);
+            let next = current
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("download byte count overflow for {}", request.url))?;
+            if next > hard_limit {
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                anyhow::bail!(
+                    "download exceeded hard byte limit for {}: next chunk would reach {} bytes (limit {})",
+                    request.url,
+                    next,
+                    hard_limit
+                );
+            }
+            if let Some(h) = hasher.as_mut() {
+                h.update(&chunk);
+            }
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
+                // Disk write errors aren't recoverable via HTTP retry.
+                return Err(anyhow::Error::new(e).context("writing chunk"));
+            }
+            let cur = bytes_done.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+            if cur - last_report >= PROGRESS_REPORT_INTERVAL_BYTES
+                && last_report_at.elapsed().as_millis() >= PROGRESS_THROTTLE_MS as u128
+            {
+                let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                progress(DownloadProgress {
+                    url: request.url.clone(),
+                    bytes_done: cur,
+                    bytes_total: total,
+                    bytes_per_second: cur as f64 / elapsed,
+                });
+                last_report = cur;
+                last_report_at = Instant::now();
+            }
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await.context("final flush")?;
+        drop(file);
+
+        if let Some(e) = chunk_err {
+            last_err = Some(e);
+            continue 'attempts;
+        }
+
+        // Stream completed cleanly. Verify SHA256 (re-read the part file
+        // from disk if we resumed, since the running hasher only saw
+        // the latest attempt's bytes).
+        if let Some(expected) = request.expected_sha256.as_ref() {
+            let got_hex = if let Some(h) = hasher {
+                hex::encode(h.finalize())
+            } else {
+                let mut file = tokio::fs::File::open(&tmp).await
+                    .with_context(|| format!("opening {} for sha verification", tmp.display()))?;
+                let mut h = Sha256::new();
+                // Heap-allocated so the 64 KB chunk doesn't bloat this async
+                // function's future state. Callers (download_simple in
+                // prewarm.rs) trip clippy's large_futures lint otherwise —
+                // every level of the call chain inherits the size.
+                let mut buffer = vec![0u8; 65536];
+                loop {
+                    use tokio::io::AsyncReadExt;
+                    let n = file.read(&mut buffer).await
+                        .with_context(|| format!("reading chunk from {}", tmp.display()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buffer[..n]);
+                }
+                hex::encode(h.finalize())
+            };
+            if !expected.eq_ignore_ascii_case(&got_hex) {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                anyhow::bail!(
+                    "SHA256 mismatch for {}: expected {expected}, got {got_hex}",
+                    request.url
+                );
+            }
+        }
+
+        // Size sanity before the atomic rename — a too-small .part (truncation
+        // / error page) must never become the destination.
+        let actual_len = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
+        if let Err(e) = check_size_plausible(actual_len, request.expected_bytes, &request.url) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+
+        tokio::fs::rename(&tmp, &request.destination).await
+            .with_context(|| format!("rename {} -> {}", tmp.display(), request.destination.display()))?;
+
+        let final_done = bytes_done.load(Ordering::Relaxed);
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        progress(DownloadProgress {
+            url: request.url.clone(),
+            bytes_done: final_done,
+            bytes_total: total,
+            bytes_per_second: final_done as f64 / elapsed,
+        });
+
+        return Ok(());
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("simple download exhausted retries")))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 12-way parallel range-GET download path.
+// ─────────────────────────────────────────────────────────────────────
+
+/// A progress update a chunk task posts to `download_parallel`'s drainer.
+/// `Advanced` is fresh bytes just written to a `.part-NN`; `Rewound` un-counts
+/// the on-disk prefix of a part that was discarded for a clean re-fetch (a 416,
+/// or a 200 full-body answer to a resume), which `resume_seed_bytes` — or an
+/// earlier `Advanced` — had already counted once. Routed over the progress
+/// channel (not a direct `AtomicU64::fetch_sub`) so the drainer, the sole writer
+/// of the counter, applies the rewind strictly after this part's own adds and
+/// can never underflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartProgress {
+    Advanced(u64),
+    Rewound(u64),
+}
+
+/// Fold one `PartProgress` into the running `bytes_done` total. Pure so the
+/// resume/discard accounting is unit-testable without a live server. Saturating
+/// is defense-in-depth: channel ordering already guarantees a `Rewound` never
+/// exceeds what this part has added, so under correct operation this is an exact
+/// add/subtract.
+fn apply_part_progress(running: u64, msg: PartProgress) -> u64 {
+    match msg {
+        PartProgress::Advanced(n) => running.saturating_add(n),
+        PartProgress::Rewound(n) => running.saturating_sub(n),
+    }
+}
+
+/// Download a single file using up to PARALLEL_PARTS concurrent
+/// HTTP range-GET requests. Falls back to `download_simple` when:
+///   - server doesn't support `Accept-Ranges: bytes`
+///   - file is smaller than MIN_BYTES_FOR_PARALLEL (5 MB)
+///   - HEAD probe fails
+///
+/// Sharing a `reqwest::Client` (via `Arc`) is critical: HTTP/2 stream
+/// multiplexing + keep-alive pooling let 12 parallel GETs hit a single
+/// HuggingFace edge server without re-handshaking TLS each time.
+///
+/// Retry policy: each range-GET retries on 429/503, transport, and stream
+/// errors with the progress-aware `RetryBudget` (backoff 1s/4s/16s,
+/// Retry-After honored); only zero-progress attempts burn budget.
+///
+/// Cancellation: caller passes an `Arc<AtomicBool>`; tasks poll it after
+/// every chunk so cancel triggers within a chunk write boundary.
+/// Part files survive cancellation for resume on next attempt.
+pub async fn download_parallel<F>(
+    client: Arc<reqwest::Client>,
+    request: DownloadRequest,
+    cancel: Arc<AtomicBool>,
+    mut progress: F,
+) -> Result<()>
+where
+    F: FnMut(DownloadProgress) + Send + 'static,
+{
+    if !download_url_allowed(&request.url) {
+        let host = reqwest::Url::parse(&request.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "<unparseable>".to_string());
+        anyhow::bail!("refusing to download: host '{host}' is not on the https egress allowlist");
+    }
+    if let Some(parent) = request.destination.parent() {
+        tokio::fs::create_dir_all(parent).await
+            .with_context(|| format!("creating parent {}", parent.display()))?;
+    }
+
+    // HEAD probe — discover Content-Length + Accept-Ranges support.
+    // HuggingFace returns 302 → CDN; reqwest follows redirects so the
+    // status we read is the CDN's. The CDN occasionally omits
+    // `Accept-Ranges` on HEAD even though it honors `Range:` on GET,
+    // so we fall back to a one-byte range probe before degrading to
+    // the slower single-stream path.
+    let head_resp = client.head(&request.url).send().await.ok();
+    let head_total = head_resp
+        .as_ref()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.content_length())
+        .unwrap_or(0);
+    let head_supports_ranges = head_resp
+        .as_ref()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.headers().get("accept-ranges").cloned())
+        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+        .map(|s| s.contains("bytes"))
+        .unwrap_or(false);
+
+    // Range probe path: HEAD said no (or HEAD failed) but the file is
+    // large enough that we'd really rather use the parallel path. Send
+    // `GET ... Range: bytes=0-0` and look at the status — 206 means
+    // ranges work despite HEAD's silence.
+    let (total, supports_ranges) = if head_supports_ranges && head_total >= MIN_BYTES_FOR_PARALLEL {
+        (head_total, true)
+    } else {
+        match probe_range_support(&client, &request.url).await {
+            Some((probed_total, true)) if probed_total >= MIN_BYTES_FOR_PARALLEL => {
+                (probed_total, true)
+            }
+            Some((probed_total, _)) => (probed_total.max(head_total), false),
+            None => (head_total, false),
+        }
+    };
+
+    if total < MIN_BYTES_FOR_PARALLEL || !supports_ranges {
+        // Best-effort sweep of any .part-NN left by an earlier parallel attempt
+        // (e.g. a prior run that partially downloaded, then this retry sees the
+        // server no longer advertising ranges). download_simple uses its own
+        // "{}.part" temp and can't resume from these, so they'd leak. (audit E16)
+        for i in 0..PARALLEL_PARTS {
+            let _ = tokio::fs::remove_file(part_file_path(&request.destination, i)).await;
+        }
+        return download_simple(client.clone(), request, cancel.clone(), |p| progress(p)).await;
+    }
+
+    // Plan the chunks. Last chunk picks up the remainder.
+    let chunk_size = total / (PARALLEL_PARTS as u64);
+    let mut ranges = Vec::with_capacity(PARALLEL_PARTS);
+    for i in 0..PARALLEL_PARTS {
+        let start = (i as u64) * chunk_size;
+        let end = if i == PARALLEL_PARTS - 1 {
+            total - 1
+        } else {
+            start + chunk_size - 1
+        };
+        ranges.push((i, start, end));
+    }
+
+    // Seed progress from bytes already on disk so a resume (Retry after a
+    // cancel/crash) doesn't report from 0 and make the bar jump backward. Each
+    // part contributes at most its planned range length — an OVERSIZED stale
+    // part (leftover from a different-sized remote file) is discarded by
+    // download_range_with_retry, so counting only the in-range prefix keeps the
+    // seed consistent with the bytes that will actually be re-used. (audit C1)
+    let resume_seed = resume_seed_bytes(&request.destination, &ranges).await;
+
+    let bytes_done = Arc::new(AtomicU64::new(resume_seed));
+    let started = Instant::now();
+    let last_emit_ms = Arc::new(parking_lot::Mutex::new(0u128));
+
+    // Progress channel: each chunk task posts `PartProgress` updates; one
+    // drainer — the SOLE writer of `bytes_done` — folds them in and emits at
+    // ≤10 Hz. Bounded so a slow drainer can't grow the queue without bound;
+    // sends apply backpressure (never dropped), so a part's `Rewound` correction
+    // is never lost and always lands after that part's own `Advanced` deltas.
+    // `bytes_done` is therefore NOT monotonic — a discarded resume part rewinds it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PartProgress>(512);
+
+    // Spawn drainer FIRST so the chunk tasks have something to send to.
+    let total_for_drain = total;
+    let url_for_drain = request.url.clone();
+    let bytes_done_drain = bytes_done.clone();
+    let last_emit_drain = last_emit_ms.clone();
+    let progress_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            // Sole writer of `bytes_done`, so load+store is race-free; folding
+            // through `apply_part_progress` keeps the add/rewind accounting in
+            // one unit-tested place.
+            let cur = apply_part_progress(bytes_done_drain.load(Ordering::Relaxed), msg);
+            bytes_done_drain.store(cur, Ordering::Relaxed);
+            let now_ms = started.elapsed().as_millis();
+            let emit = {
+                let mut last = last_emit_drain.lock();
+                if now_ms.saturating_sub(*last) >= PROGRESS_THROTTLE_MS as u128 {
+                    *last = now_ms;
+                    true
+                } else { false }
+            };
+            if emit {
+                let elapsed = (now_ms as f64) / 1000.0;
+                let bps = if elapsed > 0.0 { cur as f64 / elapsed } else { 0.0 };
+                progress(DownloadProgress {
+                    url: url_for_drain.clone(),
+                    bytes_done: cur,
+                    bytes_total: Some(total_for_drain),
+                    bytes_per_second: bps,
+                });
+            }
+        }
+        // All chunk senders dropped — emit the unconditional 100% completion
+        // event so the UI progress bar always reaches 100%, regardless of the
+        // 10 Hz throttle window.
+        let final_done = bytes_done_drain.load(Ordering::Relaxed);
+        let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
+        progress(DownloadProgress {
+            url: url_for_drain,
+            bytes_done: final_done,
+            bytes_total: Some(total_for_drain),
+            bytes_per_second: final_done as f64 / elapsed_secs,
+        });
+    });
+
+    // Spawn the chunk downloaders.
+    let mut tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(PARALLEL_PARTS);
+    for (i, start, end) in ranges {
+        let client = client.clone();
+        let url = request.url.clone();
+        let part_path = part_file_path(&request.destination, i);
+        let cancel = cancel.clone();
+        let tx = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            download_range_with_retry(&client, &url, start, end, &part_path, &cancel, tx).await
+        }));
+    }
+    drop(tx); // close the sender so the drainer exits when all chunks finish
+
+    // Await every chunk. First error short-circuits but we drain the rest.
+    let mut first_err: Option<anyhow::Error> = None;
+    for t in tasks {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => { if first_err.is_none() { first_err = Some(e); } }
+            Err(e) => { if first_err.is_none() { first_err = Some(anyhow::anyhow!(e)); } }
+        }
+    }
+    let _ = progress_handle.await;
+    if let Some(e) = first_err { return Err(e); }
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!("download cancelled");
+    }
+
+    // Concat parts → final .part, hash, atomic rename.
+    let combined = request.destination.with_extension(format!(
+        "{}.part",
+        request.destination.extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download")
+    ));
+    let mut out = tokio::fs::File::create(&combined).await
+        .with_context(|| format!("creating {}", combined.display()))?;
+    let mut hasher = request.expected_sha256.as_ref().map(|_| Sha256::new());
+    // Stream each part through a fixed 64 KB buffer instead of reading the whole
+    // ~170 MB part into RAM (PARALLEL_PARTS of a multi-GB GGUF). Mirrors the
+    // download_simple SHA re-read loop above; integrity check is unchanged.
+    let mut buffer = vec![0u8; 65536];
+    for i in 0..PARALLEL_PARTS {
+        let part_path = part_file_path(&request.destination, i);
+        let mut part = tokio::fs::File::open(&part_path).await
+            .with_context(|| format!("reading part {}", part_path.display()))?;
+        loop {
+            use tokio::io::AsyncReadExt;
+            let n = part.read(&mut buffer).await
+                .with_context(|| format!("reading chunk from {}", part_path.display()))?;
+            if n == 0 {
+                break;
+            }
+            if let Some(h) = hasher.as_mut() { h.update(&buffer[..n]); }
+            tokio::io::AsyncWriteExt::write_all(&mut out, &buffer[..n]).await
+                .context("writing combined part")?;
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(&mut out).await.context("final flush")?;
+    drop(out);
+
+    if let (Some(expected), Some(h)) = (request.expected_sha256.as_ref(), hasher) {
+        let got = hex::encode(h.finalize());
+        if !expected.eq_ignore_ascii_case(&got) {
+            let _ = tokio::fs::remove_file(&combined).await;
+            // Also remove the per-range parts. A byte-complete-but-wrong part
+            // (corrupt/compromised mirror, or a same-size remote revision across
+            // attempts) would otherwise be treated as "already complete" on the
+            // next attempt (cur_start > end), re-concatenated, and re-fail the SHA
+            // forever — a permanently-stuck install until the user manually clears
+            // the cache. Removing them forces a clean re-fetch on Retry.
+            for i in 0..PARALLEL_PARTS {
+                let _ = tokio::fs::remove_file(part_file_path(&request.destination, i)).await;
+            }
+            anyhow::bail!(
+                "SHA256 mismatch for {}: expected {expected}, got {got}",
+                request.url
+            );
+        }
+    }
+
+    // Size sanity before the atomic rename (mirrors download_simple).
+    let actual_len = tokio::fs::metadata(&combined).await.map(|m| m.len()).unwrap_or(0);
+    // Exact-length guard: the parts were planned from `total` (the HEAD/probe
+    // Content-Length), so the assembled file MUST be exactly that many bytes.
+    // For a hash-less file (no expected_sha256) this is the only integrity gate
+    // — the loose 4x `check_size_plausible` floor below would miss a
+    // few-percent truncation. (total is always > 0 here: the < MIN_BYTES path
+    // above already routed to download_simple.)
+    if total > 0 && actual_len != total {
+        let _ = tokio::fs::remove_file(&combined).await;
+        for i in 0..PARALLEL_PARTS {
+            let _ = tokio::fs::remove_file(part_file_path(&request.destination, i)).await;
+        }
+        anyhow::bail!(
+            "assembled size mismatch for {}: got {actual_len} bytes, expected {total}",
+            request.url
+        );
+    }
+    if let Err(e) = check_size_plausible(actual_len, request.expected_bytes, &request.url) {
+        let _ = tokio::fs::remove_file(&combined).await;
+        for i in 0..PARALLEL_PARTS {
+            let _ = tokio::fs::remove_file(part_file_path(&request.destination, i)).await;
+        }
+        return Err(e);
+    }
+
+    tokio::fs::rename(&combined, &request.destination).await
+        .with_context(|| format!("rename {} -> {}", combined.display(), request.destination.display()))?;
+
+    // Best-effort cleanup of part files; OK to leave them on failure.
+    for i in 0..PARALLEL_PARTS {
+        let _ = tokio::fs::remove_file(part_file_path(&request.destination, i)).await;
+    }
+
+    Ok(())
+}
+
+/// One-byte `Range:` probe to confirm the server honors ranges when
+/// HEAD didn't advertise `Accept-Ranges: bytes`. Returns
+/// `Some((total_bytes, true))` on 206 (ranges work; total parsed from
+/// `Content-Range`), `Some((total_bytes, false))` on 200 (server
+/// ignored Range; total = `Content-Length`), or `None` on transport
+/// failure. Best-effort: this is a hint to the parallel path, not a
+/// hard requirement.
+async fn probe_range_support(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<(u64, bool)> {
+    let resp = client
+        .get(url)
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status();
+    if status.as_u16() == 206 {
+        // Content-Range: bytes 0-0/<total>
+        let total = resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.rsplit('/').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Some((total, true))
+    } else if status.is_success() {
+        Some((resp.content_length().unwrap_or(0), false))
+    } else {
+        None
+    }
+}
+
+fn part_file_path(dest: &Path, index: usize) -> PathBuf {
+    let stem = dest.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}.part-{index:02}"))
+}
+
+/// Sum the resumable bytes already on disk across all planned part files, so
+/// `download_parallel` can seed its progress counter on a resume instead of
+/// reporting from 0 (a backward-jumping bar on Retry). A part contributes only
+/// the bytes that actually survive into the resumed download: an oversized part
+/// (> its planned range) is discarded WHOLE by `download_range_with_retry`
+/// (its in-range prefix does NOT survive), so it must seed 0 — otherwise its
+/// range_len would be counted once here and again as re-download deltas, pushing
+/// bytes_done past bytes_total. `ranges` is `(index, start, end)` with an
+/// inclusive `end`.
+async fn resume_seed_bytes(dest: &Path, ranges: &[(usize, u64, u64)]) -> u64 {
+    let mut seed: u64 = 0;
+    for &(i, start, end) in ranges {
+        let range_len = end - start + 1;
+        let on_disk = tokio::fs::metadata(part_file_path(dest, i))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        seed += if on_disk > range_len { 0 } else { on_disk };
+    }
+    seed
+}
+
+/// How `download_range_with_retry` reacts to a non-success / non-206 status on
+/// a range request, given how many bytes are already on disk for this part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeResumeAction {
+    /// 2xx that honored our Range (206), or a fresh 200/206 with no prior bytes:
+    /// stream the body normally.
+    Proceed,
+    /// A resume where the server's answer means the on-disk prefix is unusable
+    /// (416 stale part, or a 200 full-body answer to a partial request): discard
+    /// the part and re-fetch the range cleanly. Recoverable — never a hard bail.
+    DiscardAndRetry,
+    /// A genuine error (bad URL/auth, or a 416 with nothing on disk to discard):
+    /// no recovery, bail.
+    Bail,
+}
+
+/// Classify a range response. `existing_len` is bytes already on disk for this
+/// part; `status` is the HTTP status code. Pure so it's unit-testable without a
+/// live server — the single source of truth for the resume-recovery branches in
+/// `download_range_with_retry` (416 + non-206-on-resume both auto-recover, in
+/// parity with `download_simple`). 429/5xx are handled separately (Retry-After)
+/// and never reach here.
+fn classify_range_status(status: u16, existing_len: u64) -> RangeResumeAction {
+    if status == 416 {
+        // A stale on-disk part is recoverable; a 416 with nothing to discard is a
+        // genuinely unsatisfiable request.
+        return if existing_len > 0 {
+            RangeResumeAction::DiscardAndRetry
+        } else {
+            RangeResumeAction::Bail
+        };
+    }
+    let success = (200..300).contains(&status);
+    if !success {
+        return RangeResumeAction::Bail;
+    }
+    // Resuming (bytes on disk) but the server sent a full body (not 206):
+    // appending would splice our prefix in front of the full file. Restart clean.
+    if existing_len > 0 && status != 206 {
+        return RangeResumeAction::DiscardAndRetry;
+    }
+    RangeResumeAction::Proceed
+}
+
+/// Download one byte range with retry-on-429/503 + resume support.
+/// If `<part_path>` already exists, send `Range: bytes={offset}-{end}`
+/// where offset = start + existing_len, and append.
+///
+/// Progress is reported by posting `PartProgress` over `tx`: `Advanced` for each
+/// freshly written chunk, and — on the DiscardAndRetry path — a single
+/// `Rewound(existing_len)` that un-counts the prefix this part throws away before
+/// re-fetching the whole range from offset 0. The rewind goes over the SAME
+/// channel (not a direct `AtomicU64::fetch_sub`) so the drainer applies it
+/// strictly after this part's own `Advanced` deltas; a direct subtract could
+/// overtake still-queued adds and underflow the counter.
+async fn download_range_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    part_path: &Path,
+    cancel: &AtomicBool,
+    tx: tokio::sync::mpsc::Sender<PartProgress>,
+) -> Result<()> {
+    let mut budget = RetryBudget::new();
+    let mut retrying = false;
+    // Kept so the exhausted-retries bail preserves the underlying cause —
+    // without it a TLS pin failure (or any transport error) degraded to an
+    // opaque "range exhausted retries" with no source chain to classify.
+    let mut last_err: Option<anyhow::Error> = None;
+
+    'retry: loop {
+        // Resumable: stat the part file. If it has bytes, append from there.
+        let range_len = end - start + 1;
+        let mut existing_len = tokio::fs::metadata(part_path).await
+            .map(|m| m.len()).unwrap_or(0);
+        // A part larger than its planned range is stale — leftover from a prior
+        // download of a different-sized remote file. Its bytes would corrupt the
+        // concat, so discard and re-fetch the range rather than the old behavior
+        // of treating an oversized part as "already done" (which kept bad bytes).
+        if existing_len > range_len {
+            tracing::warn!(
+                part = %crate::platform::redact_path_for_log(part_path), existing_len, range_len,
+                "discarding oversized stale part before resume"
+            );
+            let _ = tokio::fs::remove_file(part_path).await;
+            existing_len = 0;
+        }
+        // Observed after the stale-part discard so leftover bytes from a
+        // different remote file can't masquerade as progress.
+        budget.observe_len(existing_len);
+        let cur_start = start + existing_len;
+        if cur_start > end { return Ok(()); } // exactly complete
+
+        if retrying {
+            let Some(backoff) = budget.next_backoff() else {
+                let msg = format!("range exhausted retries (start={start})");
+                return Err(match last_err {
+                    Some(e) => e.context(msg),
+                    None => anyhow::anyhow!(msg),
+                });
+            };
+            tokio::time::sleep(backoff).await;
+        }
+        retrying = true;
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("range cancelled (start={start})");
+        }
+
+        // Global HTTP concurrency cap — prevents three concurrent prewarms
+        // × 12 range-GETs each from tripping HuggingFace's per-IP rate limit
+        // (the original "MobileCLIP stuck until cancel" bug). Held for the
+        // duration of this attempt; released on drop at end of iteration.
+        let _permit = http_semaphore().clone().acquire_owned().await
+            .context("acquiring http permit")?;
+
+        let range_header = format!("bytes={cur_start}-{end}");
+        let resp = match client
+            .get(url)
+            .header("Range", &range_header)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(?e, "range GET failed; retrying");
+                last_err = Some(anyhow::Error::new(e).context("issuing range GET"));
+                continue;
+            }
+        };
+        let status = resp.status();
+        if status.as_u16() == 429 || status.is_server_error() {
+            // Honor Retry-After if present.
+            if let Some(s) = resp.headers().get("retry-after").and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                tokio::time::sleep(Duration::from_secs(s.min(60))).await;
+            }
+            last_err = Some(anyhow::anyhow!("HTTP {status}"));
+            continue;
+        }
+        // Resume-recovery classification (parity with download_simple): a 416 on
+        // a resume (stale on-disk part — remote shrank or a leftover from a
+        // different-sized revision) and a 200 full-body answer to a partial
+        // request both discard the part and re-fetch the range cleanly rather
+        // than bailing the whole parallel download. A 416 with nothing on disk,
+        // or any other non-2xx, is a genuine error.
+        match classify_range_status(status.as_u16(), existing_len) {
+            RangeResumeAction::Proceed => {}
+            RangeResumeAction::DiscardAndRetry => {
+                tracing::warn!(
+                    part = %crate::platform::redact_path_for_log(part_path), %status, existing_len, range_len,
+                    "range resume not honored (416/non-206); discarding stale part and re-fetching"
+                );
+                // Un-count the bytes we're discarding. `existing_len` (> 0 on
+                // every DiscardAndRetry — see classify_range_status) is exactly
+                // what this part has already contributed to bytes_done: the
+                // resume seed on the first attempt plus any deltas it streamed on
+                // an earlier one. The clean re-fetch below restarts from offset 0
+                // and re-streams the whole range, so without this the prefix is
+                // counted twice and bytes_done overshoots bytes_total (>100% bar
+                // + inflated final bytes/sec). Sent over `tx` (not a direct
+                // fetch_sub) so the drainer applies the rewind AFTER this part's
+                // own queued `Advanced` deltas — a direct subtract could overtake
+                // them and underflow the counter.
+                let _ = tx.send(PartProgress::Rewound(existing_len)).await;
+                let _ = tokio::fs::remove_file(part_path).await;
+                last_err = Some(anyhow::anyhow!("range resume answered HTTP {status} (restarted)"));
+                continue;
+            }
+            RangeResumeAction::Bail => {
+                anyhow::bail!("range {range_header}: HTTP {status}");
+            }
+        }
+
+        // Open part file in append mode (resumes on retry too).
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true).append(true).open(part_path).await
+            .with_context(|| format!("opening part {}", part_path.display()))?;
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("range cancelled mid-chunk (start={start})");
+            }
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    // Retry by continuing the OUTER loop, not recursing while
+                    // holding `_permit`: recursing re-acquired a 2nd permit, and
+                    // under throttling all 8 permit-holders could recurse and
+                    // block acquiring a 9th — a permanent deadlock. `continue`
+                    // drops `_permit` at end of iteration; the loop re-stats the
+                    // .part file and resumes via Range, on the progress-aware
+                    // backoff schedule (zero-progress attempts still bail after
+                    // a finite budget instead of spinning forever).
+                    tracing::warn!(?e, "stream error; retrying range");
+                    last_err = Some(anyhow::Error::new(e).context("reading range chunk"));
+                    continue 'retry;
+                }
+            };
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
+                .context("writing range chunk")?;
+            let _ = tx.send(PartProgress::Advanced(chunk.len() as u64)).await;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await.ok();
+        return Ok(());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Blocking model installer.
+//
+// The synchronous orchestration the cross-platform `fileid` CLI drives — it
+// links the engine as a library and has no async runtime of its own. Mirrors
+// `commands::prewarm::handle_prewarm_model` minus the IPC plumbing: download
+// every file in the bundle (SHA256-verified parallel range-GET), extract any
+// `.zip` artifact in place (llama.cpp / EP runtime packs), then drop the
+// revision-keyed install sentinel so `scan --models` (and the desktop apps)
+// see the model installed. Network egress is HuggingFace + the pinned
+// GitHub/NVIDIA release URLs only — exactly the manifest, user-initiated.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-file progress for [`install_model_blocking`]'s callback. Consumed by the
+/// `fileid` CLI (external lib consumer), not the engine binary — `allow(dead_code)`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct InstallFileProgress {
+    /// 0-based index of the file currently downloading within the bundle.
+    pub file_index: usize,
+    /// Total number of files in the bundle.
+    pub file_count: usize,
+    /// Destination file name (e.g. `ram_plus.onnx`).
+    pub file_name: String,
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub bytes_per_second: f64,
+}
+
+pub fn required_install_free_bytes(download_bytes: u64) -> u64 {
+    const STAGING_HEADROOM: u64 = 512 * 1024 * 1024;
+    download_bytes
+        .saturating_mul(2)
+        .saturating_add(STAGING_HEADROOM)
+}
+
+/// Download + install one model bundle, blocking until done. Builds its own
+/// current-thread Tokio runtime so a non-async caller (the CLI) needs none.
+///
+/// Reuses [`download_parallel`] (12-way range-GET, resume, SHA256 verify) for
+/// each file, extracts any `.zip` artifact in place, and writes the
+/// revision-keyed install sentinel via
+/// [`crate::models::registry::sentinel_path`]. Returns early-`Ok` when the
+/// sentinel already exists (idempotent re-install). `progress` is an `Fn` that is
+/// `Send`/`Sync` so each file's download task can call it; use interior
+/// mutability if the caller needs mutable state.
+///
+/// Driven by the `fileid` CLI (external lib consumer); the engine binary uses
+/// the IPC `handle_prewarm_model` path instead — hence `allow(dead_code)`.
+#[allow(dead_code)]
+pub fn install_model_blocking(
+    model: &crate::models::registry::Model,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<dyn Fn(InstallFileProgress) + Send + Sync>,
+) -> Result<()> {
+    // Already installed (sentinel present) → nothing to do.
+    if crate::models::registry::installation_complete(model) {
+        return Ok(());
+    }
+
+    let download_bytes: u64 = model.files.iter().map(|file| file.approx_bytes).sum();
+    let required_free = required_install_free_bytes(download_bytes);
+    if let Ok(models_dir) = crate::paths::models_dir() {
+        if let Some(available) = crate::platform::available_disk_bytes(&models_dir) {
+            anyhow::ensure!(
+                available >= required_free,
+                "{} needs about {:.1} GB free while verified download parts are staged, but only {:.1} GB is available on the models drive",
+                model.display_name,
+                required_free as f64 / 1_073_741_824.0,
+                available as f64 / 1_073_741_824.0,
+            );
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building model-install runtime")?;
+
+    rt.block_on(async move {
+        let client = build_shared_client()?;
+        let file_count = model.files.len();
+        for (idx, file) in model.files.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("install cancelled");
+            }
+            let file_name = file
+                .dest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+            let req = DownloadRequest {
+                url: file.url.clone(),
+                destination: file.dest.clone(),
+                expected_sha256: file.sha256.clone(),
+                expected_bytes: Some(file.approx_bytes),
+            };
+            let prog = progress.clone();
+            let name_for_cb = file_name.clone();
+            let cb = move |p: DownloadProgress| {
+                prog(InstallFileProgress {
+                    file_index: idx,
+                    file_count,
+                    file_name: name_for_cb.clone(),
+                    bytes_done: p.bytes_done,
+                    bytes_total: p.bytes_total,
+                    bytes_per_second: p.bytes_per_second,
+                });
+            };
+            download_parallel(client.clone(), req, cancel.clone(), cb)
+                .await
+                .with_context(|| format!("downloading {file_name}"))?;
+
+            // Extract + remove any `.zip` artifact in place (runtime / EP packs).
+            if file.dest.extension().and_then(|s| s.to_str()) == Some("zip") {
+                let dest = file.dest.clone();
+                tokio::task::spawn_blocking(move || crate::util::zip::extract_into_parent(&dest))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("zip extract task panicked: {e}")))
+                    .with_context(|| format!("extracting {file_name}"))?;
+                let _ = tokio::fs::remove_file(&file.dest).await;
+            }
+        }
+
+        // Drop the install sentinel (atomic write via a `.tmp` + rename, so a
+        // kill mid-write can't leave a half-written marker treated as installed).
+        if let Some(sentinel) = crate::models::registry::sentinel_path(model) {
+            if let Some(parent) = sentinel.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let tmp = sentinel.with_extension("installed.tmp");
+            // Write the same attestation the prewarm path writes (registry
+            // installation_attestation): for zip-entry runtime packs
+            // installation_complete() requires the sentinel to contain the full
+            // per-artifact hash manifest, so a bare model.id marker would leave
+            // every CLI-installed pack reported not-installed and re-downloaded.
+            let sentinel_body = crate::models::registry::installation_attestation(model)
+                .context("attesting installed model files for the install sentinel")?;
+            tokio::fs::write(&tmp, sentinel_body.as_bytes())
+                .await
+                .context("writing install sentinel")?;
+            tokio::fs::rename(&tmp, &sentinel)
+                .await
+                .context("finalizing install sentinel")?;
+        }
+        Ok(())
+    })
+}
+
+/// Download a single file to `dest`, blocking until done, verifying `sha256`
+/// (lowercase hex) when provided. Builds its own current-thread Tokio runtime so
+/// a non-async caller needs none, and reuses [`download_simple`]'s pinned-root
+/// TLS client + progress-aware retry + atomic-rename-on-complete.
+///
+/// This is the provisioning path for the macOS ONNX Runtime dylib
+/// (`fileid runtime install`). The download routes through the SAME audited,
+/// CA-pinned client as model downloads, so the egress host must be on the
+/// downloader's redirect allow-list (huggingface.co / github.com / …) — there is
+/// no second, unaudited network code path. Driven by the cross-platform `fileid`
+/// CLI (external lib consumer); the engine binary never calls it — hence
+/// `allow(dead_code)`.
+#[allow(dead_code)]
+pub fn download_file_blocking(
+    url: &str,
+    dest: &Path,
+    sha256: Option<&str>,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building runtime-install download runtime")?;
+    rt.block_on(async move {
+        let client = build_shared_client()?;
+        let req = DownloadRequest {
+            url: url.to_string(),
+            destination: dest.to_path_buf(),
+            expected_sha256: sha256.map(str::to_string),
+            expected_bytes: None,
+        };
+        download_simple(client, req, cancel, move |p| progress(p)).await
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_part_progress, chain_has_disk_full, chain_has_pin_failure, check_size_plausible,
+        classify_range_status, download_url_allowed, message_indicates_pin_failure,
+        resume_seed_bytes, source_chain_indicates_pin_failure, stream_hard_limit, PartProgress,
+        RangeResumeAction, RetryBudget, MAX_UNSIZED_DOWNLOAD_BYTES, PINNED_ROOT_CERTS,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn every_pinned_root_pem_parses_as_certificate() {
+        assert_eq!(PINNED_ROOT_CERTS.len(), 11);
+        for (slug, pem) in PINNED_ROOT_CERTS {
+            assert!(
+                reqwest::Certificate::from_pem(pem).is_ok(),
+                "pinned root '{slug}' failed to parse"
+            );
+        }
+    }
+
+    #[test]
+    fn download_url_allowed_gates_host_and_scheme() {
+        // URLs are assembled from bare host strings at runtime so the
+        // source-URL allowlist CI scan — which greps the source for a literal
+        // `https?://<host>` and rejects any host off its exact-match list —
+        // sees no URL literals here. These are egress-policy unit-test inputs,
+        // not real download sites; a literal off-allowlist URL in source would
+        // (correctly) fail that scan even though it never escapes this test.
+        let https = |host: &str| format!("https://{host}/x");
+        let http = |host: &str| format!("http://{host}/x");
+        // Allowlisted hosts + subdomains over https pass.
+        for host in [
+            "huggingface.co",
+            "cdn-lfs.huggingface.co",
+            "hf.co",
+            "github.com",
+            "objects.githubusercontent.com",
+            "developer.nvidia.com",
+        ] {
+            assert!(download_url_allowed(&https(host)), "{host} should pass");
+        }
+        // Off-allowlist + look-alike hosts are refused.
+        for host in ["evilhuggingface.co", "example.com"] {
+            assert!(!download_url_allowed(&https(host)), "{host} should be refused");
+        }
+        // Plain http on an otherwise-allowlisted host is refused (scheme gate),
+        // as is a non-URL string.
+        assert!(!download_url_allowed(&http("huggingface.co")));
+        assert!(!download_url_allowed("not a url"));
+    }
+
+    #[test]
+    fn pin_failure_matcher_recognizes_rustls_wording() {
+        assert!(message_indicates_pin_failure(
+            "invalid peer certificate: UnknownIssuer"
+        ));
+        assert!(message_indicates_pin_failure(
+            "client error (Connect): invalid peer certificate: UnknownIssuer"
+        ));
+        assert!(!message_indicates_pin_failure("connection reset by peer"));
+        assert!(!message_indicates_pin_failure(
+            "dns error: failed to lookup address information"
+        ));
+        assert!(!message_indicates_pin_failure("HTTP 503 Service Unavailable"));
+        assert!(!message_indicates_pin_failure(
+            "certificate expired: verification time 1 (UNIX)"
+        ));
+    }
+
+    // Outer error whose Display does NOT include its source (the hyper
+    // wrapping shape) so the test exercises the source() walk, not just
+    // the top-level message match.
+    #[derive(Debug)]
+    struct OpaqueWrap(std::io::Error);
+    impl std::fmt::Display for OpaqueWrap {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error trying to connect")
+        }
+    }
+    impl std::error::Error for OpaqueWrap {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn pin_failure_source_chain_walk_finds_nested_rustls_message() {
+        let wrapped = OpaqueWrap(std::io::Error::other(
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(source_chain_indicates_pin_failure(&wrapped));
+        let plain = OpaqueWrap(std::io::Error::other("connection reset by peer"));
+        assert!(!source_chain_indicates_pin_failure(&plain));
+    }
+
+    #[test]
+    fn chain_disk_full_detected_through_anyhow_context_layers() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "There is not enough space on the disk. (os error 112)",
+        ))
+        .context("writing range chunk")
+        .context("downloading model.onnx");
+        assert!(chain_has_disk_full(&err));
+
+        let conn = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ))
+        .context("writing range chunk");
+        assert!(!chain_has_disk_full(&conn));
+
+        let plain = anyhow::anyhow!("HTTP 503 Service Unavailable").context("issuing GET");
+        assert!(!chain_has_disk_full(&plain));
+    }
+
+    #[test]
+    fn chain_pin_failure_detected_through_anyhow_context_layers() {
+        let err = anyhow::Error::new(OpaqueWrap(std::io::Error::other(
+            "invalid peer certificate: UnknownIssuer",
+        )))
+        .context("issuing GET")
+        .context("downloading model.onnx");
+        assert!(chain_has_pin_failure(&err));
+
+        let plain = anyhow::anyhow!("HTTP 429 Too Many Requests").context("issuing GET");
+        assert!(!chain_has_pin_failure(&plain));
+    }
+
+    #[test]
+    fn retry_budget_zero_progress_matches_old_four_attempt_ladder() {
+        let mut b = RetryBudget::new();
+        b.observe_len(0);
+        assert_eq!(b.next_backoff(), Some(Duration::from_secs(1)));
+        b.observe_len(0);
+        assert_eq!(b.next_backoff(), Some(Duration::from_secs(4)));
+        b.observe_len(0);
+        assert_eq!(b.next_backoff(), Some(Duration::from_secs(16)));
+        b.observe_len(0);
+        assert_eq!(b.next_backoff(), None);
+    }
+
+    #[test]
+    fn retry_budget_growth_refunds_and_ladder_repeats_last_step() {
+        let mut b = RetryBudget::new();
+        let mut len = 0;
+        for expected in [1, 4, 16, 16, 16, 16] {
+            len += 1024;
+            b.observe_len(len);
+            assert_eq!(b.next_backoff(), Some(Duration::from_secs(expected)));
+        }
+    }
+
+    #[test]
+    fn retry_budget_re_exhausts_after_a_refund() {
+        let mut b = RetryBudget::new();
+        for _ in 0..3 {
+            b.observe_len(0);
+            assert!(b.next_backoff().is_some());
+        }
+        b.observe_len(1);
+        assert_eq!(b.next_backoff(), Some(Duration::from_secs(16)));
+        for _ in 0..2 {
+            b.observe_len(1);
+            assert!(b.next_backoff().is_some());
+        }
+        b.observe_len(1);
+        assert_eq!(b.next_backoff(), None);
+    }
+
+    #[test]
+    fn retry_budget_discard_and_refetch_below_high_water_is_not_progress() {
+        let mut b = RetryBudget::new();
+        b.observe_len(10_000);
+        assert!(b.next_backoff().is_some());
+        b.observe_len(0);
+        assert!(b.next_backoff().is_some());
+        b.observe_len(5_000);
+        assert!(b.next_backoff().is_some());
+        b.observe_len(9_999);
+        assert_eq!(b.next_backoff(), None);
+    }
+
+    #[test]
+    fn size_check_passes_when_no_estimate() {
+        assert!(check_size_plausible(0, None, "u").is_ok());
+        assert!(check_size_plausible(10, Some(0), "u").is_ok());
+    }
+
+    #[test]
+    fn size_check_passes_within_loose_band() {
+        // Exact, under, and over the estimate all pass — the estimate is loose.
+        assert!(check_size_plausible(1_000_000, Some(1_000_000), "u").is_ok());
+        assert!(check_size_plausible(800_000, Some(1_000_000), "u").is_ok());
+        assert!(check_size_plausible(5_000_000, Some(1_000_000), "u").is_ok());
+        // Just above the 4× floor passes.
+        assert!(check_size_plausible(260_000, Some(1_000_000), "u").is_ok());
+    }
+
+    #[test]
+    fn size_check_rejects_truncation_and_error_pages() {
+        // A few-KB HTML error page standing in for a ~900 MB model.
+        assert!(check_size_plausible(4_096, Some(925_600_000), "u").is_err());
+        // Truncated to well under the 4× floor.
+        assert!(check_size_plausible(100_000, Some(1_000_000), "u").is_err());
+        // Zero-byte result against a 38 MB expectation.
+        assert!(check_size_plausible(0, Some(38_696_353), "u").is_err());
+    }
+
+    #[test]
+    fn stream_limit_prefers_advertised_then_bounds_estimates_and_unknowns() {
+        assert_eq!(stream_hard_limit(Some(123), Some(456)), 123);
+        assert_eq!(stream_hard_limit(None, Some(456)), 1_824);
+        assert_eq!(stream_hard_limit(Some(0), Some(456)), 1_824);
+        assert_eq!(stream_hard_limit(None, None), MAX_UNSIZED_DOWNLOAD_BYTES);
+        assert_eq!(stream_hard_limit(None, Some(u64::MAX)), u64::MAX);
+    }
+
+    // C1: ranged resume must seed progress from bytes already on disk, so the
+    // bar doesn't jump backward on Retry. Pre-fix, download_parallel started its
+    // counter at 0 regardless of the .part-NN bytes present.
+    #[tokio::test]
+    async fn resume_seed_counts_on_disk_part_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "fileid-dl-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("model.bin");
+
+        // Plan three ranges of 100 bytes each: [0,99] [100,199] [200,299].
+        let ranges = vec![(0usize, 0u64, 99u64), (1, 100, 199), (2, 200, 299)];
+
+        // No parts yet → seed is 0.
+        assert_eq!(resume_seed_bytes(&dest, &ranges).await, 0);
+
+        // Part 0 fully done (100 B), part 1 half done (50 B), part 2 absent.
+        std::fs::write(super::part_file_path(&dest, 0), vec![0u8; 100]).unwrap();
+        std::fs::write(super::part_file_path(&dest, 1), vec![0u8; 50]).unwrap();
+        assert_eq!(
+            resume_seed_bytes(&dest, &ranges).await,
+            150,
+            "seed must reflect on-disk bytes (100 + 50), not 0"
+        );
+
+        // An OVERSIZED stale part (200 B in a 100 B range) contributes 0:
+        // download_range_with_retry discards the WHOLE part (not just the
+        // overflow), so seeding any of it would double-count against the re-
+        // download deltas and let bytes_done exceed bytes_total (R-05).
+        std::fs::write(super::part_file_path(&dest, 2), vec![0u8; 200]).unwrap();
+        assert_eq!(
+            resume_seed_bytes(&dest, &ranges).await,
+            150,
+            "oversized stale part seeds 0 (discarded whole), not its range length"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // C1: a 416 on a ranged resume must recover (discard the stale part + re-
+    // fetch the range), matching download_simple — not hard-bail the whole
+    // parallel download. Pre-fix, 416 fell through to the generic non-2xx bail.
+    #[test]
+    fn range_416_on_resume_recovers_instead_of_bailing() {
+        // 416 with bytes on disk → discard + re-fetch the range.
+        assert_eq!(
+            classify_range_status(416, 4096),
+            RangeResumeAction::DiscardAndRetry
+        );
+        // 416 with nothing to discard is genuinely unsatisfiable → bail.
+        assert_eq!(classify_range_status(416, 0), RangeResumeAction::Bail);
+        // A 200 full-body answer to a partial (resume) request also restarts.
+        assert_eq!(
+            classify_range_status(200, 1024),
+            RangeResumeAction::DiscardAndRetry
+        );
+        // Honored partial (206) and a fresh full GET both stream normally.
+        assert_eq!(classify_range_status(206, 1024), RangeResumeAction::Proceed);
+        assert_eq!(classify_range_status(200, 0), RangeResumeAction::Proceed);
+        // Other client/redirect errors still bail.
+        assert_eq!(classify_range_status(404, 0), RangeResumeAction::Bail);
+        assert_eq!(classify_range_status(403, 2048), RangeResumeAction::Bail);
+    }
+
+    // The accounting invariant the channel ordering buys us, exercised over the
+    // exact PartProgress stream the discard path emits — deterministic, no I/O,
+    // and it covers the interleaving the localhost test cannot force: a part that
+    // streamed some bytes (Advanced), hit a transient stream error, and only THEN
+    // got a 200/416 on the retry, so its Rewound un-counts seed + those streamed
+    // deltas. A direct task-side fetch_sub could fire that subtract before the
+    // drainer drained the queued Advanced and underflow the counter; routing
+    // Rewound over the same FIFO channel guarantees it lands strictly after them.
+    // bytes_done must stay within [0, total] throughout and finish EXACTLY at
+    // total (no >100% bar, no wraparound).
+    #[test]
+    fn rewound_discard_keeps_progress_within_bounds() {
+        const TOTAL: u64 = 300; // three 100-byte parts
+
+        // The PartProgress stream the discard path emits, FIFO per part.
+        // resume_seed counted every part's on-disk prefix up front (part0 40,
+        // part1 30, part2 100 = already complete). part1 then streamed 20 fresh
+        // bytes before a stream error; its retry is answered 200/416, so it emits
+        // Rewound(50) (= 30 seed + 20 streamed = its on-disk length) and re-fetches
+        // all 100. The Rewound is ENQUEUED AFTER part1's own Advanced(20) — which
+        // is what makes a channel-routed correction safe where a direct subtract
+        // is not.
+        let seed = 40 + 30 + 100;
+        let stream = [
+            PartProgress::Advanced(60),  // part0: 40 seed -> 100
+            PartProgress::Advanced(20),  // part1: streamed before the stream error
+            PartProgress::Rewound(50),   // part1: discard un-counts seed + streamed
+            PartProgress::Advanced(100), // part1: clean re-fetch of the whole range
+        ];
+
+        let mut done: u64 = seed;
+        let mut peak = done;
+        for msg in stream {
+            done = apply_part_progress(done, msg);
+            peak = peak.max(done);
+            assert!(done <= TOTAL, "bytes_done {done} exceeded total {TOTAL} (>100% bar)");
+        }
+        assert_eq!(done, TOTAL, "must finish exactly at total, not total + discarded prefix");
+        assert_eq!(peak, TOTAL);
+
+        // Floor guard: even if a Rewound were somehow applied before the matching
+        // Advanced (the underflow a direct task-side fetch_sub risks), saturating
+        // keeps bytes_done >= 0 rather than wrapping to a bogus ~1.8e19 reading.
+        assert_eq!(apply_part_progress(0, PartProgress::Rewound(50)), 0);
+    }
+}

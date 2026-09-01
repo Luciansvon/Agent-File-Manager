@@ -1,0 +1,239 @@
+name: macOS app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platforms/apple/**'
+      - 'shared/ipc-schema/**'
+      - 'shared/scripts/check_binary_privacy.py'
+      - 'shared/scripts/test_check_binary_privacy.py'
+      - '.github/workflows/macos.yml'
+  pull_request:
+    paths:
+      - 'platforms/apple/**'
+      - 'shared/ipc-schema/**'
+      - 'shared/scripts/check_binary_privacy.py'
+      - 'shared/scripts/test_check_binary_privacy.py'
+      - '.github/workflows/macos.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build app + engine (SwiftPM)
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        working-directory: platforms/apple
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Select Xcode
+        # macos-15 runners ship multiple Xcode versions; pin to the latest
+        # 16.x so Swift 6 strict concurrency + macOS 15 SDK are guaranteed.
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Swift toolchain info
+        run: swift --version
+
+      - name: Cache SwiftPM
+        # Cache only the dependency DOWNLOAD cache (resolved package sources +
+        # binary artifacts), NOT the project build products. Caching
+        # `platforms/apple/.build` (compiled .o/.swiftmodule) keyed only on
+        # Package.resolved + a broad restore-keys fallback restored STALE compiled
+        # objects whenever engine SOURCE changed but deps didn't — so `swift test`
+        # silently ran pre-change code (a non-deterministic CI that passed/failed
+        # by which objects survived). org.swift.swiftpm keeps dep downloads cached
+        # (no re-fetch); everything compiles fresh, so the test always reflects HEAD.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('platforms/apple/Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Resolve packages
+        run: swift package resolve
+
+      - name: Build engine (release)
+        run: swift build -c release --product FileIDEngine
+
+      - name: Build app (release)
+        run: swift build -c release --product FileID
+
+      - name: Run tests
+        # Swift Testing framework. SharedTests + EngineTests. Corpus tests
+        # that need a populated Tests/Corpus/ tree skip themselves when the
+        # corpus isn't present (it's downloaded via scripts/build_corpus.sh
+        # locally and is too slow/fragile to fetch in CI).
+        #
+        # 12-minute hard cap (healthy runs finish in ~3): a leaked child
+        # process holding the test harness's output pipe once turned a
+        # finished suite into a 60-minute silent hang that ate the whole
+        # job timeout. On expiry, surface which processes were still
+        # alive, then fail fast.
+        run: |
+          set -uo pipefail
+          # perl's alarm survives exec, and perl is always on the runner
+          # (coreutils timeout/gtimeout is not). SIGALRM kills the test
+          # process tree's leader at 12 min → exit 142.
+          #
+          # Capture swift test's REAL exit code: the previous
+          # `if ! cmd; then status=$?` form captured the status of the negated
+          # condition (always 0 when the `then` runs), so a failing OR
+          # non-compiling test suite was reported as exit 0 and the job went
+          # green — the macOS test gate silently never failed (a stale
+          # non-compiling test target rode green for weeks). Run directly,
+          # capture $? immediately, then branch.
+          # `--no-parallel`: several engine tests read an IPCSink pipe with a
+          # BLOCKING `availableData` read on a Task (cooperative-pool thread).
+          # Run in parallel across suites, enough of those park pool threads at
+          # once to starve the executor and intermittently wedge the
+          # swift-testing harness to the 12-min SIGALRM (a flaky exit 142 that
+          # the old masked gate hid). Serial execution runs at most one such
+          # reader at a time, so the pool can't be starved. The tests are small
+          # and fast; serial adds only seconds. (The blocking-read pattern is
+          # also being removed in the tests themselves.)
+          set +e
+          perl -e 'alarm 720; exec @ARGV or die "exec: $!"' swift test --no-parallel
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::swift test exited $status (142 = 12-min SIGALRM timeout)"
+            echo "--- surviving processes ---"
+            ps ax -o pid,ppid,etime,command | grep -E "FileID|swiftpm" | grep -v grep || true
+            exit "$status"
+          fi
+
+      - name: Verify binaries exist
+        run: |
+          set -euo pipefail
+          for bin in .build/release/FileID .build/release/FileIDEngine; do
+            if [[ ! -x "$bin" ]]; then
+              echo "::error::Missing executable: $bin"
+              exit 1
+            fi
+            size_mb=$(du -m "$bin" | cut -f1)
+            echo "$bin OK (${size_mb} MB)"
+          done
+
+      # V15.2 — engine smoke launch. Verifies the binary actually runs to
+      # the point of emitting a `ready` event and exits cleanly on stdin
+      # EOF. Catches the class of regressions where the binary builds
+      # clean but panics in main() or fails to register a ready event.
+      #
+      # NB on cross-platform parity: the Windows engine smoke also
+      # asserts `"executionProvider"` appears in the ready info, but
+      # macOS doesn't have that field — `executionProvider` is the
+      # Windows-only ORT EP picker output (DirectML / CUDA / OpenVINO /
+      # QNN). On macOS the ML pipeline uses MLX + Apple Neural Engine +
+      # CoreML with no equivalent enum. The assertion is intentionally
+      # absent here.
+      - name: Smoke — engine startup
+        run: |
+          set -euo pipefail
+          # Launch the engine with stdin closed immediately (EOF). The
+          # engine's parent-PID watchdog should observe the broken pipe
+          # on the next LineReader read and exit cleanly. We expect a
+          # single `ready` event in stdout before shutdown.
+          : | .build/release/FileIDEngine > engine.stdout 2> engine.stderr &
+          ENGINE_PID=$!
+          # 30 s budget — macos-15 runners' cold-start of GRDB + lazy
+          # MLX capability probe can stretch past the previous 15 s
+          # ceiling on the first run after a cache miss.
+          BUDGET=30
+          for i in $(seq 1 $BUDGET); do
+            if ! kill -0 $ENGINE_PID 2>/dev/null; then
+              echo "Engine exited after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+          # Diagnostic dump ALWAYS (not just on failure) so the workflow
+          # log shows what the engine emitted, regardless of which
+          # assertion fires. Without this the failure cause is opaque
+          # to anyone who can't read the CI logs.
+          echo "----- engine.stdout (size $(wc -c < engine.stdout) bytes) -----"
+          cat engine.stdout || true
+          echo
+          echo "----- engine.stderr (size $(wc -c < engine.stderr) bytes) -----"
+          cat engine.stderr || true
+          echo
+          echo "----- end -----"
+
+          if kill -0 $ENGINE_PID 2>/dev/null; then
+            kill -9 $ENGINE_PID || true
+            echo "::error::FileIDEngine did not exit within ${BUDGET}s of stdin EOF (still alive on poll)."
+            exit 1
+          fi
+          # NB: macOS engine writes IPC events to STDERR, not stdout
+          # (see platforms/apple/engine/.../IPC/IPCSink.swift:108 —
+          # `FileHandle.standardError.write(contentsOf: blob)`).
+          # The Windows engine writes to stdout, hence the stream
+          # asymmetry between this smoke and windows-engine.yml's.
+          if ! grep -q '"ready"' engine.stderr; then
+            echo "::error::engine.stderr did not contain a ready event (engine exited but never emitted ready)."
+            exit 1
+          fi
+          echo "Engine startup smoke passed. ✅"
+
+      # Privacy gate parity with Windows: source URL allowlist. Scans
+      # every .swift under platforms/apple/ for any https?:// URL and
+      # asserts every host is on the allowlist. Stops a contributor
+      # from silently adding a new download / telemetry / analytics
+      # endpoint even one that doesn't match the existing deny-list.
+      # MUST stay in sync with the Windows equivalent in windows-engine.yml.
+      - name: Privacy — source URL allowlist scan
+        run: |
+          set -euo pipefail
+          # Allowlist: same hosts as Windows. github.com appears in
+          # Package.swift for SwiftPM deps; huggingface.co for model
+          # downloads at runtime.
+          allowed=(
+            "huggingface.co"
+            "github.com"
+            "developer.download.nvidia.com"
+            "developer.nvidia.com"
+            "schemas.microsoft.com"
+            "schemas.openxmlformats.org"
+            "ai.google.dev"
+          )
+          hits=()
+          # Find all .swift under apple/, excluding .build/ + DerivedData.
+          # Anchor on "(http|https)://([a-zA-Z0-9._-]+)" — group 2 is the host.
+          while IFS= read -r line; do
+            file="${line%%:*}"
+            url="${line#*:}"
+            host=$(echo "$url" | sed -E 's|^https?://([a-zA-Z0-9._-]+).*|\1|' | tr '[:upper:]' '[:lower:]')
+            allowed_match=0
+            for a in "${allowed[@]}"; do
+              if [ "$host" = "$a" ]; then
+                allowed_match=1
+                break
+              fi
+            done
+            if [ "$allowed_match" -eq 0 ]; then
+              hits+=("$file: $url")
+            fi
+          done < <(find . -name '*.swift' -not -path '*/.build/*' -not -path '*/DerivedData/*' \
+            -exec grep -oHE 'https?://[a-zA-Z0-9._/-]+' {} \;)
+          if (( ${#hits[@]} > 0 )); then
+            printf '::error::URLs found that are not on the allowlist:\n'
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          echo "All Swift source URLs are on the allowlist. ✅"
+
+      - name: Privacy — telemetry-string scan
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/shared/scripts/check_binary_privacy.py" .build/release/FileID .build/release/FileIDEngine
+          echo "No telemetry strings detected. ✅"

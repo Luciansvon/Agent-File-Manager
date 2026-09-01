@@ -1,0 +1,347 @@
+// ArcFace face embedder — Buffalo-L (iResNet50) or Buffalo-S
+// (MobileFace) ONNX, run via ONNX Runtime with the CoreML execution
+// provider (ANE acceleration on Apple Silicon).
+//
+// Why ONNX instead of CoreML: matches Immich's posture exactly. We
+// pull the original Buffalo ONNX from the upstream Immich HuggingFace
+// repo at runtime; we never redistribute the InsightFace pre-trained
+// weights. Same legal posture, no on-device conversion step.
+//
+// Preprocessing — formerly baked into the CoreML graph via ImageType
+// scale/bias — now happens here in Swift: resize face crop to 112×112
+// RGB, normalize as (pixel − 127.5) / 127.5, pack as Float32 NCHW.
+//
+// Double-checked locking on load (avoid concurrent compile-and-load
+// races from the worker pool); DispatchSemaphore caps in-flight
+// predictions at 4 to keep the ANE from thrashing.
+import Foundation
+import CoreGraphics
+import Accelerate
+import FileIDShared
+import OnnxRuntimeBindings
+
+public final class ArcFaceService: @unchecked Sendable {
+    public static let shared = ArcFaceService()
+
+    private let lock = NSLock()
+    private let loadLock = NSLock()
+    private var env: ORTEnv?
+    private var session: ORTSession?
+    private var inputName: String?
+    private var loadedKind: FaceEmbedderKind?
+    // Defaults to 4 (ANE-thrash cap); raise on high-core Macs via FILEID_INFERENCE_CONCURRENCY.
+    private static let inferenceConcurrency: Int =
+        ProcessInfo.processInfo.environment["FILEID_INFERENCE_CONCURRENCY"]
+            .flatMap { Int($0) }.map { max(1, min(16, $0)) } ?? Hardware.defaultInferenceConcurrency
+    private let inferenceSem = DispatchSemaphore(value: ArcFaceService.inferenceConcurrency)
+
+    private init() {}
+
+    // MARK: - Paths
+
+    /// Application Support directory where face embedder ONNX files live.
+    /// Same parent directory as MobileCLIP so the user finds them in one
+    /// place from Settings → Open Models folder.
+    public static var modelsRoot: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("FileID/Models", isDirectory: true)
+    }
+
+    public static func modelURL(for kind: FaceEmbedderKind) -> URL {
+        modelsRoot.appendingPathComponent(kind.modelFileName)
+    }
+
+    public static func isInstalled(_ kind: FaceEmbedderKind) -> Bool {
+        FileManager.default.fileExists(atPath: modelURL(for: kind).path)
+    }
+
+    // MARK: - Loading
+
+    /// Load (or swap to) the requested embedder. Returns true on success;
+    /// false if the .onnx isn't on disk yet (caller should fall through
+    /// gracefully — face detection still works without an embedder, the
+    /// row just doesn't get an arcface_embedding).
+    @discardableResult
+    public func load(_ kind: FaceEmbedderKind) -> Bool {
+        // Execution-provider preference. "cpu" binds ORT's implicit CPU EP
+        // only; "coreml"/"auto" attempt the CoreML EP and fall back to CPU if
+        // it can't bind — so load() succeeds whenever ORT can parse the model,
+        // even on Macs where CoreML is unavailable. (hardening)
+        let epPref = (ProcessInfo.processInfo.environment["FILEID_FACE_EP"] ?? "auto")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        // Fast path — already loaded with the right kind.
+        lock.lock()
+        if let loaded = loadedKind, loaded == kind, session != nil {
+            lock.unlock(); return true
+        }
+        lock.unlock()
+
+        loadLock.lock()
+        defer { loadLock.unlock() }
+        // Re-check under load lock — another thread may have finished.
+        lock.lock()
+        if let loaded = loadedKind, loaded == kind, session != nil {
+            lock.unlock(); return true
+        }
+        lock.unlock()
+
+        let url = Self.modelURL(for: kind)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            JSONLog.shared.warn(ev: "arcface_model_missing",
+                                path: redactPathForLog(url.path),
+                                error: "ArcFace .onnx not present; face embedding skipped")
+            return false
+        }
+
+        do {
+            // ORTEnv is process-wide; reuse across model swaps.
+            lock.lock()
+            let cachedEnv = self.env
+            lock.unlock()
+            let env: ORTEnv
+            if let existing = cachedEnv {
+                env = existing
+            } else {
+                env = try ORTEnv(loggingLevel: ORTLoggingLevel.warning)
+            }
+            let opts = try ORTSessionOptions()
+            // CoreML EP — ANE/GPU acceleration on Apple Silicon. SFace is small
+            // enough that MLProgram + MLComputeUnits=All roughly HALVES inference
+            // on-hardware (~23 ms → ~11 ms) vs the legacy NeuralNetwork format,
+            // and the ANE accepts the compiled program cleanly — unlike the 926 MB
+            // RAM++ Swin, which it rejects, so RAM++/CLIP stay on NeuralNetwork.
+            // Leaving useCPUAndGPU/useCPUOnly unset keeps MLComputeUnits at the All
+            // default (ANE + GPU + CPU); useCPUAndGPU would EXCLUDE the ANE.
+            // Appended in its OWN do/catch: a CoreML bind failure (or an
+            // explicit FILEID_FACE_EP=cpu) drops to ORT's implicit CPU EP so
+            // session creation — and embedding — still succeed. (hardening)
+            var ep = "coreml"
+            if epPref == "cpu" {
+                ep = "cpu"
+                JSONLog.shared.warn(ev: "arcface_coreml_ep_unavailable",
+                                    path: redactPathForLog(url.path),
+                                    error: "FILEID_FACE_EP=cpu; binding ORT CPU EP only.")
+            } else {
+                do {
+                    let coremlOpts = ORTCoreMLExecutionProviderOptions()
+                    coremlOpts.createMLProgram = true
+                    coremlOpts.enableOnSubgraphs = true
+                    try opts.appendCoreMLExecutionProvider(with: coremlOpts)
+                } catch {
+                    ep = "cpu"
+                    JSONLog.shared.warn(ev: "arcface_coreml_ep_unavailable",
+                                        path: redactPathForLog(url.path),
+                                        error: "CoreML EP could not bind; falling back to CPU: \(error)")
+                }
+            }
+            let session = try ORTSession(env: env, modelPath: url.path, sessionOptions: opts)
+            // Discover input name — Buffalo ONNX uses "input.1" after
+            // PyTorch tracing renames the original; mobileface may differ.
+            let inputs = try session.inputNames()
+            guard let firstInput = inputs.first else {
+                JSONLog.shared.error(ev: "arcface_model_load_failed",
+                                     path: redactPathForLog(url.path),
+                                     error: "ONNX session reports no inputs")
+                return false
+            }
+            lock.lock()
+            self.env = env
+            self.session = session
+            self.inputName = firstInput
+            self.loadedKind = kind
+            lock.unlock()
+            JSONLog.shared.info(ev: "arcface_model_loaded",
+                                extra: ["kind": AnyCodable(kind.rawValue),
+                                        "path": AnyCodable(redactPathForLog(url.path)),
+                                        "input": AnyCodable(firstInput),
+                                        "ep": AnyCodable(ep)])
+            return true
+        } catch {
+            JSONLog.shared.error(ev: "arcface_model_load_failed",
+                                 path: redactPathForLog(url.path), error: "\(error)")
+            return false
+        }
+    }
+
+    public var isReady: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return session != nil
+    }
+
+    public var currentKind: FaceEmbedderKind? {
+        lock.lock(); defer { lock.unlock() }
+        return loadedKind
+    }
+
+    // MARK: - Inference
+
+    /// Returns an L2-normalized 128-d (SFace) embedding for the supplied
+    /// face crop. Returns nil if the model isn't loaded or inference failed.
+    public func embed(_ crop: CGImage) -> [Float]? {
+        lock.lock()
+        let s = session
+        let name = inputName
+        lock.unlock()
+        guard let s, let name else { return nil }
+        guard let tensor = makeNCHWTensor(crop, side: 112) else {
+            JSONLog.shared.error(ev: "arcface_preprocess_failed",
+                                 error: "Could not build the 112×112 NCHW input tensor from the \(crop.width)×\(crop.height) face crop; skipping this face.")
+            return nil
+        }
+
+        inferenceSem.wait()
+        defer { inferenceSem.signal() }
+
+        do {
+            // Hand ORT a heap-allocated NSMutableData seeded with a copy
+            // of the tensor bytes. The previous shape — `NSMutableData(
+            // bytes: &tensor, length: …)` over a stack-allocated [Float]
+            // — relied on ORTValue retaining the buffer for the lifetime
+            // of the call. ORT's Swift bindings don't document copy-vs-
+            // alias semantics, so we copy explicitly. ~150 KB extra per
+            // face inference; immeasurable next to the ANE work.
+            let nsData = tensor.withUnsafeBufferPointer { buf -> NSMutableData in
+                NSMutableData(bytes: buf.baseAddress, length: buf.count * MemoryLayout<Float>.stride)
+            }
+            let shape: [NSNumber] = [1, 3, 112, 112]
+            let value = try ORTValue(tensorData: nsData,
+                                     elementType: .float,
+                                     shape: shape)
+            let outputs = try s.run(withInputs: [name: value],
+                                    outputNames: Set(try s.outputNames()),
+                                    runOptions: nil)
+            guard let first = outputs.values.first else { return nil }
+            let outData = try first.tensorData() as Data
+            let count = outData.count / MemoryLayout<Float>.stride
+            // A zero-length output tensor makes `withUnsafeBytes` yield a nil
+            // baseAddress, so the `baseAddress!` below would trap and crash the engine
+            // mid-clustering — reachable via a corrupt/substituted .onnx whose output is
+            // empty (load() only checks file existence, not shape). Bail to a clean
+            // failure instead, exactly as the sibling MobileCLIPService.embedImage does
+            // before its identical unsafe read. (audit — empty-output guard)
+            guard count > 0 else {
+                JSONLog.shared.error(ev: "arcface_inference_failed",
+                                     error: "SFace produced an empty (0-length) output tensor")
+                return nil
+            }
+            var floats = [Float](repeating: 0, count: count)
+            outData.withUnsafeBytes { raw in
+                let src = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+                for i in 0..<count { floats[i] = src[i] }
+            }
+            // SFace is a 128-d embedder; a wrong/quantized export with a
+            // different output width would silently mis-cluster and diverge
+            // from the cross-platform face DB (keyed on 128-d / 512-byte
+            // blobs). Bail rather than persist an off-dim vector — mirrors
+            // the Windows engine's sface.rs guard (ENG-69).
+            let expectedDim = FaceEmbedderKind.sface.embeddingDim
+            guard floats.count == expectedDim else {
+                JSONLog.shared.error(ev: "arcface_inference_failed",
+                                     error: "SFace produced a \(floats.count)-d embedding, expected \(expectedDim) (wrong or quantized model?)")
+                return nil
+            }
+            return l2Normalize(floats)
+        } catch {
+            JSONLog.shared.error(ev: "arcface_inference_failed", error: "\(error)")
+            return nil
+        }
+    }
+
+    /// Pre-warm the model + ANE pipeline. Call before the worker pool
+    /// starts so the first 14 concurrent requests don't all race the
+    /// same first-load path.
+    public func preWarm(_ kind: FaceEmbedderKind) {
+        guard load(kind) else { return }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil, width: 32, height: 32, bitsPerComponent: 8,
+            bytesPerRow: 0, space: cs,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let img = ctx.makeImage() else { return }
+        let started = CFAbsoluteTimeGetCurrent()
+        _ = embed(img)
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        JSONLog.shared.info(ev: "arcface_prewarmed",
+                            extra: ["ms": AnyCodable(ms),
+                                    "kind": AnyCodable(kind.rawValue)])
+    }
+
+    /// Encode a 128-d (SFace) float32 embedding as a raw little-endian
+    /// blob for the DB. Symmetric with `MobileCLIPService.embeddingToBlob`.
+    public static func embeddingToBlob(_ vec: [Float]) -> Data {
+        vec.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    public static func blobToEmbedding(_ data: Data) -> [Float] {
+        let count = data.count / MemoryLayout<Float>.stride
+        // S8: an empty/corrupt blob makes `baseAddress` nil; force-unwrapping it
+        // would crash the engine. Bail to an empty vector (callers treat a
+        // zero-length embedding as "no embedding").
+        guard count > 0 else { return [] }
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> [Float] in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: Float.self) else { return [] }
+            return Array(UnsafeBufferPointer(start: base, count: count))
+        }
+    }
+
+    // MARK: - Preprocessing
+
+    /// Resize the face crop to side×side RGB and pack as a Float32 NCHW
+    /// tensor with `(pixel − 127.5) / 127.5` normalization per channel.
+    /// Output layout: [1, 3, side, side] flattened row-major (C-major).
+    private func makeNCHWTensor(_ src: CGImage, side: Int) -> [Float]? {
+        // Resize via CGContext into an RGBA8 buffer (no alpha — premul
+        // skipped via noneSkipLast so colour stays untouched).
+        let bytesPerPixel = 4
+        let bytesPerRow = side * bytesPerPixel
+        var rgba = [UInt8](repeating: 0, count: side * side * bytesPerPixel)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = rgba.withUnsafeMutableBufferPointer({ buf -> CGContext? in
+            CGContext(
+                data: buf.baseAddress, width: side, height: side,
+                bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: cs,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue
+            )
+        }) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(src, in: CGRect(x: 0, y: 0, width: side, height: side))
+
+        // Re-read the rendered pixels (CGContext writes into our buffer).
+        // Re-grab via the same closure pattern would re-allocate; just
+        // reuse rgba which was filled by ctx.draw.
+        let pixelCount = side * side
+        var planes = [Float](repeating: 0, count: pixelCount * 3)
+        // Channel order: 0=R, 1=G, 2=B (RGBX in source). Plane stride =
+        // pixelCount; spatial stride = 1.
+        // SFace takes RAW [0,255] RGB — the ONNX bakes its own (x-127.5)/128
+        // normalization internally, unlike ArcFace's (px-127.5)/127.5. So feed
+        // the pixels straight through (scale 1, bias 0). Matches the Windows
+        // sface.rs input contract so embeddings line up.
+        let bias: Float = 0.0
+        let scale: Float = 1.0
+        for i in 0..<pixelCount {
+            let r = Float(rgba[i * 4 + 0])
+            let g = Float(rgba[i * 4 + 1])
+            let b = Float(rgba[i * 4 + 2])
+            planes[0 * pixelCount + i] = r * scale + bias
+            planes[1 * pixelCount + i] = g * scale + bias
+            planes[2 * pixelCount + i] = b * scale + bias
+        }
+        return planes
+    }
+
+    // MARK: - Internals
+
+    private func l2Normalize(_ v: [Float]) -> [Float] {
+        var sum: Float = 0
+        for x in v { sum += x * x }
+        let norm = sum.squareRoot()
+        guard norm > 0 else { return v }
+        return v.map { $0 / norm }
+    }
+}

@@ -1,0 +1,721 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SettingsView — model installer cards, engine info, GPU EP override,
+    Performance Pack downloader, system info.
+
+ Hosts five panels:
+      1. Local AI — install / re-install the face models (YuNet + SFace),
+         CLIP ViT-B/32, and RAM++ auto-tagger
+      2. Engine — version, PID, worker cap, "open log folder"
+      3. Performance — GPU EP picker + Performance Pack downloader
+      4. Storage — DB path, thumbs cache, model cache
+      5. About — version + open-source credits
+-->
+<UserControl
+    x:Class="FileID.Views.Settings.SettingsView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
+        <!-- HorizontalAlignment=Center (was Stretch) so on wide
+             windows the 820-MaxWidth content centers instead of pinning
+             to the leading edge with empty right-side gutter. -->
+        <StackPanel Padding="32,32,32,32" Spacing="20" MaxWidth="820" HorizontalAlignment="Center">
+
+            <StackPanel Spacing="4">
+                <TextBlock Text="Settings" Style="{StaticResource TitleTextBlockStyle}"
+                           AutomationProperties.HeadingLevel="Level1"/>
+                <TextBlock Text="Models, GPU acceleration, storage."
+                           Style="{StaticResource BodyTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+
+            <!-- FEAT-CRIT-4: Models card. Shows install/progress per model
+                 kind, mirrors macOS Settings.swift "Local AI" section. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="Local AI" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+                    <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               TextWrapping="Wrap"
+                               Text="On-device models. Install once; everything runs locally."/>
+
+                    <!-- ArcFace. Every dynamic surface x:Binds against
+                         Svc.Arcface.* so the card reflects engine state
+                         changes regardless of where they originated
+                         (Welcome sheet, another window, etc). -->
+                    <Grid ColumnSpacing="12" Padding="14,12" CornerRadius="10"
+                          Background="{ThemeResource SubtleFillColorTertiaryBrush}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Spacing="2">
+                            <TextBlock Text="Face models (YuNet + SFace)"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                            <TextBlock Text="Face detection (YuNet) + recognition (SFace), Apache-2.0"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                            <ProgressBar Maximum="1"
+                                         Value="{x:Bind Svc.Arcface.Fraction, Mode=OneWay}"
+                                         IsIndeterminate="{x:Bind IsStarting(Svc.Arcface.Status, Svc.Arcface.HasStarted), Mode=OneWay}"
+                                         Foreground="{StaticResource GoldBrush}"
+                                         Visibility="{x:Bind VisibleIfDownloading(Svc.Arcface.Status), Mode=OneWay}"
+                                         Margin="0,4,0,0"
+                                         Height="4"/>
+                            <TextBlock FontFamily="Consolas"
+                                       FontSize="11"
+                                       Text="{x:Bind ProgressLabel(Svc.Arcface.Message, Svc.Arcface.Fraction, Svc.Arcface.BytesDone, Svc.Arcface.TotalBytes), Mode=OneWay}"
+                                       Visibility="{x:Bind VisibleIfDownloading(Svc.Arcface.Status), Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       Margin="0,2,0,0"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock FontFamily="Consolas"
+                                       FontSize="11"
+                                       Text="{x:Bind RateEtaLabel(Svc.Arcface.BytesPerSecond, Svc.Arcface.EtaSeconds), Mode=OneWay}"
+                                       Visibility="{x:Bind ShowRateEta(Svc.Arcface.Status, Svc.Arcface.HasStarted), Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock Text="{x:Bind ErrorLabel(Svc.Arcface.LastError), Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                       Visibility="{x:Bind VisibleIfFailed(Svc.Arcface.Status), Mode=OneWay}"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <TextBlock Grid.Column="1"
+                                   Text="~39 MB"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   VerticalAlignment="Center"
+                                   Margin="0,0,8,0"/>
+                        <Grid Grid.Column="2" VerticalAlignment="Center">
+                            <TextBlock Text="✓ Installed"
+                                       Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       VerticalAlignment="Center"
+                                       Visibility="{x:Bind VisibleIfInstalled(Svc.Arcface.Status), Mode=OneWay}"/>
+                            <Button Content="{x:Bind ButtonLabel(Svc.Arcface.Status), Mode=OneWay}"
+                                    Tag="arcface_buffalo"
+                                    Click="OnInstallModelClicked"
+                                    MinWidth="86"
+                                    Visibility="{x:Bind ShowActionButton(Svc.Arcface.Status), Mode=OneWay}"
+                                    AutomationProperties.Name="Install face models (YuNet + SFace)"/>
+                        </Grid>
+                    </Grid>
+
+                    <!-- CLIP ViT-B/32 — powers free-text semantic image search
+                         AND scan-time zero-shot scene tagging. -->
+                    <Grid ColumnSpacing="12" Padding="14,12" CornerRadius="10"
+                          Background="{ThemeResource SubtleFillColorTertiaryBrush}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Spacing="2">
+                            <TextBlock Text="CLIP ViT-B/32"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                            <TextBlock Text="Semantic image search — 'a dog at the beach'"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                            <ProgressBar Maximum="1"
+                                         Value="{x:Bind Svc.Clip.Fraction, Mode=OneWay}"
+                                         IsIndeterminate="{x:Bind IsStarting(Svc.Clip.Status, Svc.Clip.HasStarted), Mode=OneWay}"
+                                         Foreground="{StaticResource GoldBrush}"
+                                         Visibility="{x:Bind VisibleIfDownloading(Svc.Clip.Status), Mode=OneWay}"
+                                         Margin="0,4,0,0"
+                                         Height="4"/>
+                            <TextBlock FontFamily="Consolas"
+                                       FontSize="11"
+                                       Text="{x:Bind ProgressLabel(Svc.Clip.Message, Svc.Clip.Fraction, Svc.Clip.BytesDone, Svc.Clip.TotalBytes), Mode=OneWay}"
+                                       Visibility="{x:Bind VisibleIfDownloading(Svc.Clip.Status), Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       Margin="0,2,0,0"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock FontFamily="Consolas"
+                                       FontSize="11"
+                                       Text="{x:Bind RateEtaLabel(Svc.Clip.BytesPerSecond, Svc.Clip.EtaSeconds), Mode=OneWay}"
+                                       Visibility="{x:Bind ShowRateEta(Svc.Clip.Status, Svc.Clip.HasStarted), Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock Text="{x:Bind ErrorLabel(Svc.Clip.LastError), Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                       Visibility="{x:Bind VisibleIfFailed(Svc.Clip.Status), Mode=OneWay}"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <TextBlock Grid.Column="1"
+                                   Text="~220 MB"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   VerticalAlignment="Center"
+                                   Margin="0,0,8,0"/>
+                        <Grid Grid.Column="2" VerticalAlignment="Center">
+                            <TextBlock Text="✓ Installed"
+                                       Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       VerticalAlignment="Center"
+                                       Visibility="{x:Bind VisibleIfInstalled(Svc.Clip.Status), Mode=OneWay}"/>
+                            <Button Content="{x:Bind ButtonLabel(Svc.Clip.Status), Mode=OneWay}"
+                                    Tag="mobileclip_s2"
+                                    Click="OnInstallModelClicked"
+                                    MinWidth="86"
+                                    Visibility="{x:Bind ShowActionButton(Svc.Clip.Status), Mode=OneWay}"
+                                    AutomationProperties.Name="Install CLIP ViT-B/32"/>
+                        </Grid>
+                    </Grid>
+
+                    <!-- RAM++ auto-tagger. Primary in-scan tagger (4,585-concept
+                         multi-label ONNX); binds to Svc.RamPlus like the other
+                         cards so install state stays consistent with Welcome. -->
+                    <Grid ColumnSpacing="12" Padding="14,12" CornerRadius="10"
+                          Background="{ThemeResource SubtleFillColorTertiaryBrush}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Spacing="2">
+                            <TextBlock Text="RAM++ auto-tagger"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                            <TextBlock Text="Tags every image with thousands of everyday concepts (Apache-2.0)"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                            <ProgressBar Maximum="1"
+                                         Value="{x:Bind Svc.RamPlus.Fraction, Mode=OneWay}"
+                                         IsIndeterminate="{x:Bind IsStarting(Svc.RamPlus.Status, Svc.RamPlus.HasStarted), Mode=OneWay}"
+                                         Foreground="{StaticResource GoldBrush}"
+                                         Visibility="{x:Bind VisibleIfDownloading(Svc.RamPlus.Status), Mode=OneWay}"
+                                         Margin="0,4,0,0"
+                                         Height="4"/>
+                            <TextBlock FontFamily="Consolas"
+                                       FontSize="11"
+                                       Text="{x:Bind ProgressLabel(Svc.RamPlus.Message, Svc.RamPlus.Fraction, Svc.RamPlus.BytesDone, Svc.RamPlus.TotalBytes), Mode=OneWay}"
+                                       Visibility="{x:Bind VisibleIfDownloading(Svc.RamPlus.Status), Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       Margin="0,2,0,0"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock FontFamily="Consolas"
+                                       FontSize="11"
+                                       Text="{x:Bind RateEtaLabel(Svc.RamPlus.BytesPerSecond, Svc.RamPlus.EtaSeconds), Mode=OneWay}"
+                                       Visibility="{x:Bind ShowRateEta(Svc.RamPlus.Status, Svc.RamPlus.HasStarted), Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock Text="{x:Bind ErrorLabel(Svc.RamPlus.LastError), Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                       Visibility="{x:Bind VisibleIfFailed(Svc.RamPlus.Status), Mode=OneWay}"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <TextBlock Grid.Column="1"
+                                   Text="~882 MB"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   VerticalAlignment="Center"
+                                   Margin="0,0,8,0"/>
+                        <Grid Grid.Column="2" VerticalAlignment="Center">
+                            <TextBlock Text="✓ Installed"
+                                       Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       VerticalAlignment="Center"
+                                       Visibility="{x:Bind VisibleIfInstalled(Svc.RamPlus.Status), Mode=OneWay}"/>
+                            <Button Content="{x:Bind ButtonLabel(Svc.RamPlus.Status), Mode=OneWay}"
+                                    Tag="ram_plus"
+                                    Click="OnInstallModelClicked"
+                                    MinWidth="86"
+                                    Visibility="{x:Bind ShowActionButton(Svc.RamPlus.Status), Mode=OneWay}"
+                                    AutomationProperties.Name="Install RAM++ auto-tagger"/>
+                        </Grid>
+                    </Grid>
+
+                    <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                               TextWrapping="Wrap"
+                               Text="Optional Deep Analyze VLMs (Qwen 2.5-VL · Gemma 3 · Mistral-Small 3.2) live on the Deep Analyze tab."/>
+                </StackPanel>
+            </Border>
+
+            <!-- Engine info. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Engine" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+                    <TextBlock Text="{x:Bind EngineVersionText, Mode=OneWay}"
+                               Style="{StaticResource BodyTextBlockStyle}"/>
+                    <TextBlock Text="{x:Bind WorkerCapText, Mode=OneWay}"
+                               Style="{StaticResource BodyTextBlockStyle}"/>
+                    <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,8,0,0">
+                        <Button Content="Open log folder" Click="OnOpenLogsClicked" />
+                        <!-- Core owns the persistent engine. UI may request a clean
+                             engine cycle, but may not stop the background service. -->
+                        <Button x:Name="RestartEngineCardButton"
+                                Content="Restart engine"
+                                Click="OnRestartEngineCardClicked"
+                                ToolTipService.ToolTip="Spawn a fresh engine process. Cancels any in-flight scan." />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Performance — detected hardware + EP override. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="Performance" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+
+                    <!-- Detected GPU + adapter name. -->
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Detected GPU"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind GpuSummaryText, Mode=OneWay}"
+                                   Style="{StaticResource BodyStrongTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <!-- Active execution provider. -->
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Active acceleration"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind ExecutionProviderText, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <!-- Contextual recommendation banner — gold-tinted when present. -->
+                    <Border Padding="14,10"
+                            CornerRadius="10"
+                            Background="{ThemeResource GoldSelectedBackgroundBrush}"
+                            BorderBrush="{ThemeResource GoldSelectedStrokeBrush}"
+                            BorderThickness="1"
+                            Visibility="{x:Bind RecommendationVisibility, Mode=OneWay}">
+                        <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Top">
+                            <FontIcon Glyph="&#xE945;"
+                                      FontSize="14"
+                                      Foreground="{ThemeResource GoldBrush}"
+                                      VerticalAlignment="Top"
+                                      Margin="0,2,0,0" />
+                            <TextBlock Text="{x:Bind RecommendationText, Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Manual override. Auto-detect is the default;
+                         Settings.json persistence is wired separately. -->
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Override"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <ComboBox x:Name="ProviderCombo"
+                                  Width="240"
+                                  SelectedIndex="0"
+                                  SelectionChanged="OnProviderOverrideChanged"
+                                  AutomationProperties.Name="GPU execution provider override"
+                                  AutomationProperties.HelpText="Persisted across launches. Takes effect on the next scan.">
+                            <ComboBoxItem Content="Auto-detect (recommended)" Tag="auto"/>
+                            <ComboBoxItem Content="DirectML — universal" Tag="directml"/>
+                            <ComboBoxItem Content="CUDA — NVIDIA only" Tag="cuda"/>
+                            <ComboBoxItem Content="OpenVINO — Intel only" Tag="openvino"/>
+                            <ComboBoxItem Content="QNN — Snapdragon NPU" Tag="qnn"/>
+                            <ComboBoxItem Content="CPU only" Tag="cpu"/>
+                        </ComboBox>
+                        <TextBlock x:Name="OverrideHelpText"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap"
+                                   Text="Persisted across launches. Takes effect on the next scan (already-loaded models keep their EP)." />
+                    </StackPanel>
+
+                    <!-- NVIDIA acceleration. Only visible on
+                         NVIDIA hardware. Two affordances:
+                         (1) Install the CUDA-flavored llama.cpp for Deep Analyze
+                             (works on any modern NVIDIA driver; no separate cuDNN).
+                         (2) Direct user to NVIDIA's official cuDNN download to
+                             unlock the CUDA ORT EP for scanning. Both honest
+                             paths; nothing hidden. -->
+                    <StackPanel x:Name="NvidiaAccelerationSection"
+                                Visibility="Collapsed"
+                                Spacing="10">
+                        <TextBlock Text="NVIDIA acceleration"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+
+                        <!-- Row 1: CUDA llama.cpp for Deep Analyze. -->
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                                <TextBlock Text="CUDA llama.cpp for Deep Analyze"
+                                           Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                                <TextBlock x:Name="CudaLlamaStatusText"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           TextWrapping="Wrap"
+                                           Text="~200 MB download. Runs Deep Analyze 15-25% faster than the default Vulkan build. No separate cuDNN required."/>
+                            </StackPanel>
+                            <Button Grid.Column="1"
+                                    x:Name="InstallCudaLlamaButton"
+                                    Content="Install"
+                                    Click="OnInstallCudaLlamaClicked"
+                                    AutomationProperties.Name="Install CUDA llama.cpp for Deep Analyze"
+                                    ToolTipService.ToolTip="Downloads llama-bXXXX-bin-win-cuda-cu12.4-x64.zip from github.com/ggml-org/llama.cpp/releases." />
+                        </Grid>
+
+                        <!-- Auto-install toggle. On by default — the CUDA
+                             llama.cpp prewarm fires silently when an NVIDIA
+                             GPU is detected on the first launch. Users who
+                             prefer the Vulkan build (smaller, identical UX)
+                             can opt out here. -->
+                        <ToggleSwitch x:Name="AutoInstallCudaToggle"
+                                      Header="Auto-install CUDA acceleration"
+                                      OffContent="Off — leave Deep Analyze on Vulkan"
+                                      OnContent="On — install CUDA llama.cpp on first launch"
+                                      IsOn="True"
+                                      Toggled="OnAutoInstallCudaToggled" />
+
+                        <!-- Row 2: cuDNN for scanning ORT EP. -->
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                                <TextBlock Text="cuDNN for scanning (CUDA EP)"
+                                           Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                                <TextBlock x:Name="CudnnStatusText"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           TextWrapping="Wrap"
+                                           Text="Install NVIDIA cuDNN to unlock the CUDA execution provider for scanning (10-15% faster than DirectML on RTX-class GPUs). FileID can't redistribute cuDNN — get it from NVIDIA's developer site." />
+                                <!-- diagnostics line populated after a Verify install
+                                     click when the engine reports cuDNN absent. Explains
+                                     *why* (missing cudart64, wrong directory, etc.). -->
+                                <TextBlock x:Name="CudnnDiagnosticsText"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                                           TextWrapping="Wrap"
+                                           Visibility="Collapsed"
+                                           Margin="0,4,0,0" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                <!-- Opt-in in-app cuDNN install via the
+                                     engine's registry entry. Fetches the ~430 MB
+                                     redistributable directly from NVIDIA's
+                                     public CDN (no developer-portal login,
+                                     no manual install). -->
+                                <Button x:Name="InstallCudnnButton"
+                                        Content="Install"
+                                        Click="OnInstallCudnnClicked"
+                                        AutomationProperties.Name="Install CUDA pack for scanning (cuDNN + ORT CUDA provider)"
+                                        ToolTipService.ToolTip="Downloads cuDNN ~430 MB from NVIDIA's public CDN and registers it for the ORT CUDA EP. DirectML works fine without this — only install if you want the 10-15% scanning speedup." />
+                                <!-- re-probe after manual install. Engine doesn't
+                                     restart; just re-runs the DLL probe and emits a
+                                     hardwareReprobed event so the card flips to ✓ when
+                                     the user finishes installing cuDNN. -->
+                                <Button x:Name="VerifyCudnnButton"
+                                        Content="Verify install"
+                                        Click="OnVerifyCudnnClicked"
+                                        ToolTipService.ToolTip="Re-probe cuDNN after manually installing it from NVIDIA's site." />
+                                <Button Content="Get cuDNN"
+                                        Click="OnOpenCudnnDownloadsClicked"
+                                        ToolTipService.ToolTip="Opens developer.nvidia.com/cudnn-downloads in your default browser. Use this if you want CUDA Toolkit + cuDNN system-wide." />
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- post-verify success pill. Visible only when the
+                             re-probe confirmed cuDNN is reachable. Offers a one-click
+                             engine restart to switch from DirectML to CUDA EP. -->
+                        <Border x:Name="CudnnSuccessPill"
+                                Background="{StaticResource GoldSelectedBackgroundBrush}"
+                                BorderBrush="{StaticResource GoldBrush}"
+                                BorderThickness="1"
+                                CornerRadius="8"
+                                Padding="12,8"
+                                Visibility="Collapsed">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                                    <TextBlock x:Name="CudnnSuccessTitle"
+                                               Style="{StaticResource BodyStrongTextBlockStyle}"
+                                               Foreground="{StaticResource GoldBrush}"
+                                               Text="cuDNN detected — restart engine to switch to CUDA" />
+                                    <TextBlock x:Name="CudnnSuccessDetail"
+                                               Style="{StaticResource CaptionTextBlockStyle}"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                               TextWrapping="Wrap"
+                                               Text="The current engine session loaded DirectML at startup; a restart picks CUDA on this next spawn." />
+                                </StackPanel>
+                                <Button Grid.Column="1"
+                                        x:Name="RestartEngineButton"
+                                        Content="Restart engine"
+                                        Click="OnRestartEngineClicked"
+                                        VerticalAlignment="Center" />
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Advanced — collapsed by default, mirroring macOS's "Advanced"
+                 disclosure. Read-only hardware diagnostics + the power-user
+                 force-retag / thumbnail-cache actions live behind the chevron so
+                 the default Settings page stays clean. -->
+            <Expander HorizontalAlignment="Stretch"
+                      HorizontalContentAlignment="Stretch"
+                      CornerRadius="12"
+                      Padding="20,8,20,16">
+                <Expander.Header>
+                    <TextBlock Text="Advanced — diagnostics &amp; tools"
+                               Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+                </Expander.Header>
+                <StackPanel Spacing="14">
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="CPU"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind CpuTopologyText, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Memory"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind MemoryDiagnosticsText, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="GPU / NPU"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind GpuDiagnosticsText, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Power"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind PowerDiagnosticsText, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Scene tags"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind SceneTaggingDiagnosticsText, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <Button Content="Re-scan everything (force re-tag)"
+                                Click="OnForceRetagClicked"
+                                HorizontalAlignment="Left"
+                                Margin="0,4,0,0"
+                                ToolTipService.ToolTip="Re-scan the current library folder and recompute tags for every file, even ones already scanned. Use after a tagging change to see updated chips without deleting the database." />
+                    </StackPanel>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="Thumbnails"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   FontWeight="SemiBold"
+                                   CharacterSpacing="40" />
+                        <TextBlock Text="{x:Bind ThumbnailDiagnosticsText, Mode=OneWay}"
+                                   FontFamily="Consolas"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <Button Content="Refresh"
+                                Click="OnRefreshDiagnosticsClicked"
+                                HorizontalAlignment="Left"
+                                AutomationProperties.Name="Refresh diagnostics" />
+                    </StackPanel>
+
+                </StackPanel>
+            </Expander>
+
+            <!-- Cleanup. Mirrors macOS Settings' single "Cleanup" toggle. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="Cleanup" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+
+                    <ToggleSwitch x:Name="CleanupAutoTagToggle"
+                                  Header="Tag kept files after Cleanup auto-trash"
+                                  OffContent="Don't change tags on the keeper"
+                                  OnContent="Add a 'kept' tag to the keeper"
+                                  Toggled="OnCleanupAutoTagToggled" />
+                </StackPanel>
+            </Border>
+
+            <!-- Storage. Shows where every on-disk artifact lives — DB,
+                 thumbnail cache, model cache — so users know exactly what
+                 to back up + can clear caches when needed. Mirrors macOS
+                 SettingsView's storage subsection. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Storage" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+                    <Grid ColumnSpacing="12" RowSpacing="6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="180"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Database"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Grid.Row="0" Grid.Column="1"
+                                   Text="{x:Bind DbPathText, Mode=OneWay}"
+                                   FontFamily="Consolas" FontSize="11"
+                                   TextTrimming="CharacterEllipsis"
+                                   ToolTipService.ToolTip="{x:Bind DbPathText, Mode=OneWay}"
+                                   VerticalAlignment="Center" />
+                        <Button Grid.Row="0" Grid.Column="2"
+                                Content="Show"
+                                Click="OnShowDbFolderClicked"
+                                AutomationProperties.Name="Show database folder in File Explorer" />
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Thumbnail cache"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Grid.Row="1" Grid.Column="1"
+                                   Text="{x:Bind ThumbCachePathText, Mode=OneWay}"
+                                   FontFamily="Consolas" FontSize="11"
+                                   TextTrimming="CharacterEllipsis"
+                                   ToolTipService.ToolTip="{x:Bind ThumbCachePathText, Mode=OneWay}"
+                                   VerticalAlignment="Center" />
+                        <Button Grid.Row="1" Grid.Column="2"
+                                Content="Show"
+                                Click="OnShowThumbCacheClicked"
+                                AutomationProperties.Name="Show thumbnail cache folder in File Explorer" />
+
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Models"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Grid.Row="2" Grid.Column="1"
+                                   Text="{x:Bind ModelsPathText, Mode=OneWay}"
+                                   FontFamily="Consolas" FontSize="11"
+                                   TextTrimming="CharacterEllipsis"
+                                   ToolTipService.ToolTip="{x:Bind ModelsPathText, Mode=OneWay}"
+                                   VerticalAlignment="Center" />
+                        <Button Grid.Row="2" Grid.Column="2"
+                                Content="Show"
+                                Click="OnShowModelsFolderClicked"
+                                AutomationProperties.Name="Show models folder in File Explorer" />
+                    </Grid>
+                    <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                               TextWrapping="Wrap"
+                               Text="To uninstall FileID completely, delete the parent FileID folder under %LOCALAPPDATA% after quitting the app." />
+                </StackPanel>
+            </Border>
+
+            <!-- Recent scans. Most-recent 5 scan_sessions rows: started_at,
+                 file count, duration, root path. Refreshes whenever the
+                 Settings tab is opened (cheap query against a small table). -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Recent scans" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+                    <TextBlock x:Name="RecentScansEmptyText"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                               Text="No scans yet — pick a folder and click Start Scan in the sidebar."
+                               Visibility="Visible" />
+                    <ItemsControl x:Name="RecentScansList" />
+                </StackPanel>
+            </Border>
+
+            <!-- About. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="6">
+                    <TextBlock Text="About" Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2"/>
+                    <TextBlock Style="{StaticResource BodyTextBlockStyle}"
+                               Text="{x:Bind AppVersionText, Mode=OneWay}"/>
+                    <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               TextWrapping="Wrap"
+                               Text="On-device AI file organizer. No telemetry, no cloud, your files never leave your Mac, PC, or Linux box."/>
+                    <HyperlinkButton Content="View privacy notice"
+                                     Click="OnOpenPrivacyDocClicked"
+                                     Margin="0,4,0,0" />
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

@@ -1,0 +1,79 @@
+# Maintainer: FileID <maintainers@fileid.example>
+#
+# AUR package for the FileID Linux GTK4 app (native Arch build).
+# Arch rolling ships gtk4 4.14+ and libadwaita 1.5+, matching the app's
+# `gtk4 0.9` / `libadwaita 0.7` bindings — no Flatpak runtime needed.
+#
+# Generate .SRCINFO before publishing:  makepkg --printsrcinfo > .SRCINFO
+
+pkgname=fileid
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="On-device AI file organizer — tag, dedupe, restructure, rename files locally (GTK4)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/WebWorldWide/FileID"
+license=('Apache-2.0')
+# Native package builds link the engine against Arch's ONNX Runtime shared
+# library instead of downloading the portable static archive.
+depends=('gtk4' 'libadwaita' 'onnxruntime' 'sqlite' 'glibc' 'glib2')
+makedepends=('rust' 'cargo' 'git' 'pkgconf')
+optdepends=('tesseract: OCR for image/document text extraction'
+            'ffmpeg: video keyframe thumbnails'
+            'libheif: HEIC/HEIF image decoding (Arch libheif bundles the libde265 HEVC decoder)')
+source=("https://github.com/WebWorldWide/FileID/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('74ab7b4bec76251892877468b5c784078d9c970604701cfcea307775e598f8c9')
+options=('!lto')  # the engine's release profile already sets fat LTO
+
+prepare() {
+  cd "${srcdir}/FileID-${pkgver}/platforms/linux"
+  # Vendor crates offline against the committed lockfile (reproducible, and the
+  # cargo crate fetch is the only build step that needs network — makepkg has it).
+  export CARGO_HOME="${srcdir}/cargo-home"
+  local rust_target="$(rustc -vV | sed -n 's/host: //p')"
+  cargo fetch --locked --target "${rust_target}"
+  cargo fetch --locked --target "${rust_target}" \
+    --manifest-path ../windows/src/engine/Cargo.toml
+}
+
+build() {
+  cd "${srcdir}/FileID-${pkgver}/platforms/linux"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${PWD}/target"
+  export RUSTUP_TOOLCHAIN=stable
+  # Point ort at Arch's shared ONNX Runtime so `download-binaries` does not
+  # fetch/link the portable static archive.
+  export ORT_LIB_LOCATION=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+
+  # The GTK app and the engine binary it spawns.
+  cargo build --release --frozen
+  cargo build --release --frozen --manifest-path ../windows/src/engine/Cargo.toml --bin FileIDEngine
+}
+
+check() {
+  cd "${srcdir}/FileID-${pkgver}/platforms/linux"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${PWD}/target"
+  export RUSTUP_TOOLCHAIN=stable
+  export ORT_LIB_LOCATION=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+  cargo test --frozen --manifest-path ../windows/src/engine/Cargo.toml --lib
+}
+
+package() {
+  cd "${srcdir}/FileID-${pkgver}"
+  local target="platforms/linux/target/release"
+  local data="platforms/linux/data"
+
+  # Both binaries land in /usr/bin; the app finds FileIDEngine on $PATH / next
+  # to itself (locate_engine_binary search order).
+  install -Dm755 "${target}/fileid-linux" "${pkgdir}/usr/bin/fileid-linux"
+  install -Dm755 "${target}/FileIDEngine" "${pkgdir}/usr/bin/FileIDEngine"
+
+  install -Dm644 "${data}/io.github.fileid.FileID.desktop" \
+    "${pkgdir}/usr/share/applications/io.github.fileid.FileID.desktop"
+  install -Dm644 "${data}/io.github.fileid.FileID.metainfo.xml" \
+    "${pkgdir}/usr/share/metainfo/io.github.fileid.FileID.metainfo.xml"
+  install -Dm644 "${data}/io.github.fileid.FileID.svg" \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/io.github.fileid.FileID.svg"
+}

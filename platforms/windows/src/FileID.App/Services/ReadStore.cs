@@ -1,0 +1,860 @@
+﻿// ReadStore — app-side read-only SQLite access.
+//
+// The engine owns the writer connection (rusqlite, single-threaded by
+// design — see platforms/apple/CLAUDE.md and engine/src/db/mod.rs). The
+// app reads through ephemeral read-only connections that ride the same
+// WAL the engine writes, getting consistent snapshots without contending
+// with the writer.
+//
+// FTS5 search: matches `Database.swift`'s `searchFiles` 1:1. The same
+// match expression syntax (whitespace-separated terms with optional
+// leading/trailing wildcards). CLIP semantic search dot-products the
+// query embedding against `clip_embeddings.vector` (BLOB of float32
+// little-endian, L2-normalized — same on-disk format as macOS).
+//
+// Lifetime: one instance per FileID.App process. `Open()` is async so
+// the call site can await schema validation without blocking the UI
+// thread. `Dispose()` closes the underlying connection.
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+
+namespace FileID.Services;
+
+internal sealed class ReadStore : IAsyncDisposable, IDisposable, INotifyPropertyChanged
+{
+    private readonly string _dbPath;
+    private readonly string _connString;
+    private SqliteConnection? _connection;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private int _disposed;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    /// <summary>Humanized last error from <see cref="OpenAsync"/> — a DB-open
+    /// timeout, permission denial, lock, or corruption. Null when the store
+    /// opened cleanly (or is still waiting for the engine's first-scan DB).
+    /// Callers (LibraryViewModel / search) bind/read this to surface a
+    /// dismissible message instead of an indistinguishable silent-empty grid.</summary>
+    private string? _lastOpenError;
+    public string? LastOpenError
+    {
+        get => _lastOpenError;
+        private set
+        {
+            if (_lastOpenError == value) return;
+            _lastOpenError = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(LastOpenError)));
+        }
+    }
+
+    public ReadStore(string dbPath)
+    {
+        _dbPath = dbPath;
+        _connString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Cache = SqliteCacheMode.Shared,
+        }.ToString();
+    }
+
+    public bool IsOpen => _connection?.State == System.Data.ConnectionState.Open;
+
+    public async Task OpenAsync(CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection != null)
+            {
+                return;
+            }
+            // First-launch guard: the engine creates the DB on first scan.
+            // Until then the file doesn't exist; trying to open ReadOnly
+            // would throw. Stay closed until the engine has written rows.
+            // File.Exists wrapped — invalid-char paths or denied
+            // ACL on the parent dir would otherwise throw.
+            // offload File.Exists to the thread pool. On network
+            // shares or slow USB sticks this sync call can block the UI
+            // for hundreds of ms; the cost on a local SSD is < 1 ms so
+            // there's no downside to always going async here.
+            var dbPath = _dbPath;
+            // cap the File.Exists call. On a disconnected SMB
+            // share, the system-call can stall for 30+ seconds before
+            // returning. We'd rather treat it as "DB not present" after
+            // a few seconds than freeze startup.
+            bool dbExists;
+            using (var existsCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                existsCts.CancelAfter(TimeSpan.FromSeconds(5));
+                try
+                {
+                    dbExists = await Task.Run(() =>
+                    {
+                        try { return File.Exists(dbPath); }
+                        catch (IOException) { return false; }
+                        catch (UnauthorizedAccessException) { return false; }
+                    }, existsCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // A 5s stall on the DB path is an actionable degradation
+                    // (disconnected SMB share / unplugged USB), not the silent
+                    // first-launch "DB not yet created" case — surface it so the
+                    // caller shows a dismissible "drive unreachable" message
+                    // rather than an indistinguishable empty grid.
+                    DebugLog.Warn($"ReadStore.OpenAsync: File.Exists timed out for {PathRedactor.Redact(dbPath)}; treating as missing.");
+                    LastOpenError = "FileID couldn't reach the library folder (the drive may be disconnected or slow). Check the drive is connected and try again.";
+                    return;
+                }
+            }
+            if (!dbExists)
+            {
+                // Genuine first-launch: the engine hasn't created the DB yet.
+                // Stay silent (no error) — this is an expected transient state.
+                return;
+            }
+            SqliteConnection? conn = null;
+            try
+            {
+                conn = new SqliteConnection(_connString);
+                await conn.OpenAsync(ct).ConfigureAwait(false);
+                // Match the engine's PRAGMA shape so reads see the same cache /
+                // mmap behavior as the writer (these are no-ops on read-only,
+                // but documented for parity).
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "PRAGMA query_only = ON;";
+                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+                _connection = conn;
+                conn = null;
+                LastOpenError = null;
+            }
+            catch (OperationCanceledException)
+            {
+                conn?.Dispose();
+                throw; // caller-initiated cancellation — not an error to surface
+            }
+            catch (Exception ex)
+            {
+                // DB open / first-PRAGMA failure: locked (BUSY), permission
+                // denied (CANTOPEN), corrupt image, full disk, IO error. These
+                // used to propagate raw and get swallowed by the caller's bare
+                // catch — surface a humanized, actionable message AND rethrow so
+                // an awaiting caller still observes the failure.
+                conn?.Dispose();
+                LastOpenError = SqliteErrorTranslator.Humanize(ex);
+                DebugLog.Warn($"ReadStore.OpenAsync: open failed for {PathRedactor.Redact(_dbPath)}: {ex.Message}");
+                throw;
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// FTS5-backed full-text search over filename, OCR, documents, and the
+    /// canonical Folder Vision content chunks. Uses the same match-expression
+    /// shape as macOS — whitespace-joined terms.
+    /// </summary>
+    public async Task<IReadOnlyList<FileRow>> SearchAsync(
+        string query, int limit, CancellationToken ct, string? kind = null)
+    {
+        if (_connection == null)
+        {
+            return Array.Empty<FileRow>();
+        }
+        var trimmedSearch = query?.Trim();
+        if (string.IsNullOrEmpty(trimmedSearch))
+        {
+            return await RecentAsync(limit, ct, kind).ConfigureAwait(false);
+        }
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return Array.Empty<FileRow>();
+            var rows = new List<FileRow>(limit);
+            var seen = new HashSet<long>();
+            using var cmd = _connection.CreateCommand();
+
+            // NFC-normalize first (macOS parity): SQLite LIKE compares bytes,
+            // and path_search stores the NFC form (v16) so an NFC query
+            // matches Mac/NAS-synced NFD names too.
+            var escapedSearch = trimmedSearch
+                .Normalize(NormalizationForm.FormC)
+                .Replace("\\", "\\\\")
+                .Replace("%", "\\%")
+                .Replace("_", "\\_");
+            var like = $"%{escapedSearch}%";
+            var match = BuildMatchExpression(trimmedSearch);
+            var hasMatch = !string.IsNullOrEmpty(match);
+            // PAR-116: filter kind in SQL (before LIMIT) so a kind-restricted grid fills.
+            var kindClause = string.IsNullOrEmpty(kind) || kind == "all" ? "" : " AND f.kind = $kind";
+
+            var lexicalCte = hasMatch
+                ? """
+                  WITH lexical_hits(file_id, relevance) AS (
+                      SELECT rowid, bm25(ocr_fts, 1.0)
+                      FROM ocr_fts WHERE ocr_fts MATCH $match
+                      UNION ALL
+                      SELECT rowid, bm25(doc_fts, 1.0)
+                      FROM doc_fts WHERE doc_fts MATCH $match
+                      UNION ALL
+                      SELECT f2.id, bm25(content_chunks_fts, 3.0, 1.0)
+                      FROM content_chunks_fts
+                      INNER JOIN content_chunks c ON c.rowid = content_chunks_fts.rowid
+                      INNER JOIN files f2 ON f2.internal_asset_id = c.internal_asset_id
+                      WHERE content_chunks_fts MATCH $match
+                  ),
+                  ranked_hits(file_id, relevance) AS (
+                      SELECT file_id, MIN(relevance) FROM lexical_hits GROUP BY file_id
+                  )
+                  """
+                : """
+                  WITH ranked_hits(file_id, relevance) AS (
+                      SELECT NULL, NULL WHERE 0
+                  )
+                  """;
+
+            cmd.CommandText = $"""
+            {lexicalCte}
+            SELECT f.id, f.path_text, f.kind, f.size_bytes, f.modified_at, f.has_faces, f.has_text,
+                   (SELECT GROUP_CONCAT(tag, '|') FROM (SELECT tag FROM tags WHERE file_id = f.id AND source IN ('auto','user','vlm') ORDER BY CASE source WHEN 'user' THEN 0 WHEN 'vlm' THEN 1 ELSE 2 END, score DESC, rowid)) AS auto_tags,
+                   f.vlm_proposed_name
+            FROM files f
+            LEFT JOIN ranked_hits rh ON rh.file_id = f.id
+            WHERE f.failed = 0 AND f.lifecycle_status = 'active'{kindClause}
+              AND (
+                   rh.file_id IS NOT NULL
+                   OR f.path_search LIKE $like ESCAPE '\'
+                   OR f.vlm_proposed_name LIKE $like ESCAPE '\'
+                   OR f.vlm_description LIKE $like ESCAPE '\'
+                   OR f.id IN (SELECT file_id FROM tags WHERE tag LIKE $like ESCAPE '\')
+                   OR f.id IN (
+                       SELECT fp.file_id FROM face_prints fp
+                       INNER JOIN persons p ON p.id = fp.person_id
+                       WHERE p.name LIKE $like ESCAPE '\'
+                          OR p.first_name LIKE $like ESCAPE '\'
+                          OR p.last_name LIKE $like ESCAPE '\'
+                   )
+              )
+            ORDER BY
+              CASE
+                WHEN f.path_search LIKE $like ESCAPE '\' THEN 0
+                WHEN f.vlm_proposed_name LIKE $like ESCAPE '\' THEN 1
+                WHEN rh.file_id IS NOT NULL THEN 2
+                ELSE 3
+              END,
+              rh.relevance ASC,
+              f.scanned_at DESC,
+              f.id DESC
+            LIMIT $limit
+            """;
+
+            if (hasMatch)
+            {
+                cmd.Parameters.AddWithValue("$match", match);
+            }
+            cmd.Parameters.AddWithValue("$like", like);
+            cmd.Parameters.AddWithValue("$limit", limit);
+            if (kindClause.Length > 0) cmd.Parameters.AddWithValue("$kind", kind!);
+
+            using (var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false))
+            {
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    var row = ReadRow(reader);
+                    if (seen.Add(row.Id))
+                    {
+                        rows.Add(row);
+                    }
+                }
+            }
+            return rows;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Most-recently-scanned files as a fallback when the search box is empty
+    /// (or when CLIP isn't installed yet). scanned_at DESC puts freshly scanned
+    /// files at the TOP (macOS parity); id DESC breaks sub-second ties.
+    /// </summary>
+    public async Task<IReadOnlyList<FileRow>> RecentAsync(int limit, CancellationToken ct, string? kind = null)
+    {
+        if (_connection == null) return Array.Empty<FileRow>();
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return Array.Empty<FileRow>();
+            var rows = new List<FileRow>(limit);
+            using var cmd = _connection.CreateCommand();
+            // PAR-116: filter kind in SQL (before LIMIT). `failed = 0` is the
+            // BASE predicate (matches SearchAsync / SemanticSearchAsync and the
+            // macOS reference) so files the engine flagged failed (corrupt /
+            // unreadable / permission-denied) don't leak into the default grid as
+            // broken placeholder tiles and inflate the count-vs-grid mismatch.
+            var kindClause = string.IsNullOrEmpty(kind) || kind == "all" ? "" : " AND kind = $kind";
+            cmd.CommandText = $"""
+                SELECT id, path_text, kind, size_bytes, modified_at, has_faces, has_text,
+                       (SELECT GROUP_CONCAT(tag, '|') FROM (SELECT tag FROM tags WHERE file_id = files.id AND source IN ('auto','user','vlm') ORDER BY CASE source WHEN 'user' THEN 0 WHEN 'vlm' THEN 1 ELSE 2 END, score DESC, rowid)) AS auto_tags,
+                       vlm_proposed_name
+                FROM files WHERE failed = 0 AND lifecycle_status = 'active'{kindClause}
+                ORDER BY scanned_at DESC, id DESC LIMIT $limit
+                """;
+            cmd.Parameters.AddWithValue("$limit", limit);
+            if (kindClause.Length > 0) cmd.Parameters.AddWithValue("$kind", kind!);
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                rows.Add(ReadRow(reader));
+            }
+            return rows;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// CLIP semantic search: dot-product the L2-normalized query embedding
+    /// against every `clip_embeddings.vector`, take the top-`limit`. The
+    /// embedding rows are pre-normalized so cosine similarity == dot product.
+    /// cut: scans every embedding (acceptable up to ~50K files);
+    /// swaps in an HNSW or IVF index if benchmarks demand it.
+    /// </summary>
+    public async Task<IReadOnlyList<FileRowWithScore>> SemanticSearchAsync(
+        float[] queryEmbedding, int limit, CancellationToken ct, string? kind = null)
+    {
+        if (_connection == null || queryEmbedding.Length == 0)
+        {
+            return Array.Empty<FileRowWithScore>();
+        }
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return Array.Empty<FileRowWithScore>();
+            var heap = new PriorityQueue<FileRowWithScore, float>(limit);
+            using var cmd = _connection.CreateCommand();
+            // PAR-117: exclude failed files — a corrupt file with a stale CLIP
+            // embedding must not surface in semantic results. PAR-116: filter by
+            // kind in SQL so a kind-restricted grid isn't under-filled by the
+            // post-fetch C# filter.
+            var kindClause = string.IsNullOrEmpty(kind) || kind == "all" ? "" : " AND f.kind = $kind";
+            cmd.CommandText = $"""
+            SELECT f.id, f.path_text, f.kind, f.size_bytes, f.modified_at,
+                   f.has_faces, f.has_text,
+                   (SELECT GROUP_CONCAT(tag, '|') FROM (SELECT tag FROM tags WHERE file_id = f.id AND source IN ('auto','user','vlm') ORDER BY CASE source WHEN 'user' THEN 0 WHEN 'vlm' THEN 1 ELSE 2 END, score DESC, rowid)) AS auto_tags,
+                   f.vlm_proposed_name,
+                   e.embedding
+            FROM clip_embeddings e
+            JOIN files f ON f.id = e.file_id
+            WHERE f.failed = 0 AND f.lifecycle_status = 'active'{kindClause}
+            """;
+            if (kindClause.Length > 0) cmd.Parameters.AddWithValue("$kind", kind!);
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                var blob = (byte[])reader.GetValue(9);
+                // Skip dimension-mismatched/corrupt embeddings instead of
+                // scoring them 0 and occupying a result slot — parity with the
+                // macOS reference guard (#15).
+                if (blob.Length != queryEmbedding.Length * 4) continue;
+                float score = DotProduct(queryEmbedding, blob);
+                // Materialize the FileRow (GROUP_CONCAT split + List + record)
+                // only for rows the bounded top-K heap actually retains — the
+                // vast majority of embedding rows are discarded, so ReadRow on
+                // every row was pure Gen0 churn. SimilarFilesAsync already heaps
+                // ids and fetches survivors afterward; mirror that here. Reading
+                // by column index stays valid until the next ReadAsync, so a lazy
+                // materialize inside the enqueue branches is byte-identical.
+                if (heap.Count < limit)
+                {
+                    heap.Enqueue(new FileRowWithScore(ReadRow(reader), score), score);
+                }
+                else if (heap.TryPeek(out _, out var minScore) && score > minScore)
+                {
+                    heap.Dequeue();
+                    heap.Enqueue(new FileRowWithScore(ReadRow(reader), score), score);
+                }
+            }
+            // Heap holds best `limit` ordered worst→best; reverse to best→worst.
+            var sorted = new List<FileRowWithScore>(heap.Count);
+            while (heap.Count > 0)
+            {
+                sorted.Add(heap.Dequeue());
+            }
+            sorted.Reverse();
+            return sorted;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Fetch similar files by finding the seed file's embedding and ranking others by cosine similarity.
+    /// Matches macOS similarFiles(toFileID:limit:) exactly.
+    /// </summary>
+    public async Task<IReadOnlyList<FileRow>> SimilarFilesAsync(long seedId, int limit, CancellationToken ct)
+    {
+        if (_connection == null)
+        {
+            return Array.Empty<FileRow>();
+        }
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return Array.Empty<FileRow>();
+
+            // 1. Get seed embedding
+            float[]? seedVec = null;
+            using (var cmd = _connection.CreateCommand())
+            {
+                cmd.CommandText = "SELECT embedding FROM clip_embeddings WHERE file_id = $seedId";
+                cmd.Parameters.AddWithValue("$seedId", seedId);
+                using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                if (await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    seedVec = BlobToFloats((byte[])reader.GetValue(0));
+                }
+            }
+
+            if (seedVec == null || seedVec.Length == 0)
+            {
+                return Array.Empty<FileRow>();
+            }
+
+            // 2. Fetch all other embeddings and calculate cosine similarity
+            var heap = new PriorityQueue<long, float>(limit);
+            using (var cmd = _connection.CreateCommand())
+            {
+                cmd.CommandText = "SELECT file_id, embedding FROM clip_embeddings WHERE file_id != $seedId";
+                cmd.Parameters.AddWithValue("$seedId", seedId);
+                using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    var fid = reader.GetInt64(0);
+                    var blob = (byte[])reader.GetValue(1);
+                    // Skip dimension-mismatched embeddings (parity w/ macOS, #15).
+                    if (blob.Length != seedVec.Length * 4) continue;
+                    float score = DotProduct(seedVec, blob);
+
+                    if (heap.Count < limit)
+                    {
+                        heap.Enqueue(fid, score);
+                    }
+                    else if (heap.TryPeek(out _, out var minScore) && score > minScore)
+                    {
+                        heap.Dequeue();
+                        heap.Enqueue(fid, score);
+                    }
+                }
+            }
+
+            // 3. Extract the best IDs in descending order
+            var topIDs = new List<long>(heap.Count);
+            while (heap.Count > 0)
+            {
+                topIDs.Add(heap.Dequeue());
+            }
+            topIDs.Reverse();
+
+            if (topIDs.Count == 0)
+            {
+                return Array.Empty<FileRow>();
+            }
+
+            // 4. Fetch file rows for those IDs in the ranked order
+            var rows = new List<FileRow>(topIDs.Count);
+            var idPlaceholders = new List<string>();
+            using (var cmd = _connection.CreateCommand())
+            {
+                for (int j = 0; j < topIDs.Count; j++)
+                {
+                    var paramName = $"$id{j}";
+                    idPlaceholders.Add(paramName);
+                    cmd.Parameters.AddWithValue(paramName, topIDs[j]);
+                }
+                cmd.CommandText = $"""
+                SELECT id, path_text, kind, size_bytes, modified_at, has_faces, has_text,
+                       (SELECT GROUP_CONCAT(tag, '|') FROM (SELECT tag FROM tags WHERE file_id = files.id AND source IN ('auto','user','vlm') ORDER BY CASE source WHEN 'user' THEN 0 WHEN 'vlm' THEN 1 ELSE 2 END, score DESC, rowid)) AS auto_tags,
+                       vlm_proposed_name
+                FROM files
+                WHERE id IN ({string.Join(",", idPlaceholders)})
+                  AND failed = 0 AND lifecycle_status = 'active'
+                """;
+
+                var byId = new Dictionary<long, FileRow>();
+                using (var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false))
+                {
+                    while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                    {
+                        var row = ReadRow(reader);
+                        byId[row.Id] = row;
+                    }
+                }
+
+                foreach (var id in topIDs)
+                {
+                    if (byId.TryGetValue(id, out var row))
+                    {
+                        rows.Add(row);
+                    }
+                }
+            }
+
+            return rows;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>enumerate files that have a VLM-proposed name
+    /// pending. Powers the Deep Analyze "Pending renames (N)" pill so
+    /// the user can bulk-apply the VLM's suggestions without manually
+    /// walking the library. Mirrors the Files schema's
+    /// <c>vlm_proposed_name</c> column.</summary>
+    public async Task<IReadOnlyList<ProposedRenameRow>> PendingProposedRenamesAsync(
+        int limit, CancellationToken ct)
+    {
+        if (_connection == null) return Array.Empty<ProposedRenameRow>();
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return Array.Empty<ProposedRenameRow>();
+            var rows = new List<ProposedRenameRow>(limit);
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                SELECT id, path_text, vlm_proposed_name
+                FROM files
+                WHERE vlm_proposed_name IS NOT NULL
+                  AND vlm_proposed_name != ''
+                  AND lifecycle_status = 'active'
+                ORDER BY vlm_analyzed_at DESC
+                LIMIT $limit
+                """;
+            cmd.Parameters.AddWithValue("$limit", limit);
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                rows.Add(new ProposedRenameRow(
+                    Id: reader.GetInt64(0),
+                    Path: reader.GetString(1),
+                    ProposedName: reader.GetString(2)));
+            }
+            return rows;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Item 5: keyword tag → file ids carrying it, for the "Apply
+    /// tags" action. Grouped by tag so each distinct tag is written once across
+    /// all its files via a single applyTags command (call count bounded by the
+    /// number of distinct tags, not files).</summary>
+    public async Task<IReadOnlyDictionary<string, List<long>>> KeywordTagFileIdsAsync(CancellationToken ct)
+    {
+        var map = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+        if (_connection == null) return map;
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return map;
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                SELECT tags.file_id, tags.tag
+                FROM tags
+                INNER JOIN files ON files.id = tags.file_id
+                WHERE files.failed = 0 AND files.lifecycle_status = 'active'
+                  AND tags.tag IS NOT NULL AND tags.tag != ''
+                """;
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                long fileId = reader.GetInt64(0);
+                string tag = reader.GetString(1);
+                if (!map.TryGetValue(tag, out var ids)) { ids = new List<long>(); map[tag] = ids; }
+                ids.Add(fileId);
+            }
+            return map;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Item 5: named-person display name → file ids containing them,
+    /// for the "Apply people as tags" action. Skips Unknown / unnamed clusters.
+    /// Display name mirrors the engine's format_person_ref (title+first, else
+    /// first, else title, else legacy name).</summary>
+    public async Task<IReadOnlyDictionary<string, List<long>>> NamedPersonFileIdsAsync(CancellationToken ct)
+    {
+        var map = new Dictionary<string, List<long>>(StringComparer.Ordinal);
+        if (_connection == null) return map;
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return map;
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                SELECT face_prints.file_id, persons.title, persons.first_name,
+                       persons.middle_name, persons.last_name, persons.suffix, persons.name
+                FROM persons
+                INNER JOIN face_prints ON face_prints.person_id = persons.id
+                INNER JOIN files ON files.id = face_prints.file_id
+                WHERE IFNULL(persons.is_unknown, 0) = 0
+                  AND (persons.name IS NOT NULL OR persons.first_name IS NOT NULL
+                       OR persons.title IS NOT NULL OR persons.last_name IS NOT NULL)
+                  AND files.failed = 0 AND files.lifecycle_status = 'active'
+                """;
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                long fileId = reader.GetInt64(0);
+                string name = FormatPersonTagName(
+                    reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.IsDBNull(2) ? null : reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6));
+                if (name.Length == 0) continue;
+                if (!map.TryGetValue(name, out var ids)) { ids = new List<long>(); map[name] = ids; }
+                if (!ids.Contains(fileId)) ids.Add(fileId);
+            }
+            return map;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Item 5: the person's name for file tagging — the non-empty
+    /// [title, first, middle, last, suffix] joined by single spaces, else the legacy
+    /// `name`. Byte-faithful with the macOS `ReadStore.personTagName` so a person is
+    /// tagged identically on both platforms.</summary>
+    private static string FormatPersonTagName(string? title, string? first, string? middle,
+                                              string? last, string? suffix, string? legacy)
+    {
+        var parts = new List<string>(5);
+        foreach (var s in new[] { title, first, middle, last, suffix })
+        {
+            var t = (s ?? "").Trim();
+            if (t.Length > 0) parts.Add(t);
+        }
+        if (parts.Count > 0) return string.Join(" ", parts);
+        return (legacy ?? "").Trim();
+    }
+
+    /// <summary>count of files with a VLM-proposed name pending.
+    /// Cheap (COUNT(*) on indexed/sparse column); polled by the Deep
+    /// Analyze pill to know whether to show it.</summary>
+    public async Task<int> PendingProposedRenameCountAsync(CancellationToken ct)
+    {
+        if (_connection == null) return 0;
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return 0;
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText =
+                "SELECT COUNT(*) FROM files WHERE lifecycle_status = 'active' AND vlm_proposed_name IS NOT NULL AND vlm_proposed_name != ''";
+            var result = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+            return result is null ? 0 : Convert.ToInt32(result);
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Distinct file kinds present in the library — drives the kind filter
+    /// segmented control in the Library tab.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, int>> KindCountsAsync(CancellationToken ct)
+    {
+        if (_connection == null) return new Dictionary<string, int>();
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_connection == null) return new Dictionary<string, int>();
+            var dict = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "SELECT kind, COUNT(*) FROM files WHERE lifecycle_status = 'active' GROUP BY kind";
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                dict[reader.GetString(0)] = reader.GetInt32(1);
+            }
+            return dict;
+        }
+        finally { _gate.Release(); }
+    }
+
+    private static FileRow ReadRow(SqliteDataReader reader)
+    {
+        // Optional 8th column (auto-tags, pipe-delimited via
+        // GROUP_CONCAT). Queries that don't project tags get
+        // FieldCount=7 and Tags stays null; the Library card binding
+        // hides the chip strip when Tags is null/empty.
+        System.Collections.Generic.IReadOnlyList<string>? tags = null;
+        if (reader.FieldCount > 7 && !reader.IsDBNull(7))
+        {
+            var raw = reader.GetString(7);
+            if (!string.IsNullOrEmpty(raw))
+            {
+                // Drop generic/medium RAM++ tags that read as noise on a card
+                // (mirrors ram_plus.rs SUPPRESSED_TAGS) so libraries scanned
+                // before the engine-side filter don't surface them. The file
+                // *is* a photo; faces are surfaced by the People tab.
+                var parts = raw.Split('|', StringSplitOptions.RemoveEmptyEntries);
+                var kept = new System.Collections.Generic.List<string>(parts.Length);
+                foreach (var p in parts)
+                {
+                    var lower = p.Trim().ToLowerInvariant();
+                    if (lower is "image" or "photo" or "photograph" or "photography" or "picture" or "face")
+                    {
+                        continue;
+                    }
+                    kept.Add(p);
+                }
+                tags = kept;
+            }
+        }
+        // Optional 9th column: vlm_proposed_name (smart-rename
+        // proposal from Deep Analyze). When present the Library card
+        // shows it in gold below the filename, matching macOS
+        // LibraryView.swift's golden smartName affordance.
+        string? proposedName = null;
+        if (reader.FieldCount > 8 && !reader.IsDBNull(8))
+        {
+            var raw = reader.GetString(8);
+            if (!string.IsNullOrWhiteSpace(raw)) proposedName = raw;
+        }
+        return new FileRow(
+            Id: reader.GetInt64(0),
+            Path: reader.GetString(1),
+            Kind: reader.GetString(2),
+            SizeBytes: reader.GetInt64(3),
+            ModifiedAt: reader.IsDBNull(4) ? null : reader.GetDouble(4),
+            HasFaces: reader.GetInt32(5) != 0,
+            HasText: reader.GetInt32(6) != 0,
+            Tags: tags,
+            ProposedName: proposedName);
+    }
+
+    private static string BuildMatchExpression(string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return string.Empty;
+        }
+        // Quote-wrap each term and append `*` so partial matches hit. FTS5
+        // syntax: " ".join('"foo"*', '"bar"*'). Drop tokens shorter than 2
+        // chars to avoid degenerate explosion of matches.
+        var parts = new List<string>();
+        foreach (var raw in query.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var token = raw.Trim().Replace("\"", string.Empty);
+            if (token.Length < 2)
+            {
+                continue;
+            }
+            parts.Add($"\"{token}\"*");
+        }
+        return string.Join(' ', parts);
+    }
+
+    private static float[] BlobToFloats(byte[] blob)
+    {
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(blob);
+        return span.ToArray();
+    }
+
+    private static float DotProduct(float[] q, byte[] blob)
+    {
+        if (blob.Length != q.Length * 4) return 0f;
+        var qSpan = q.AsSpan();
+        var blobFloats = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(blob);
+        float acc = 0f;
+        int i = 0;
+        int simdLength = System.Numerics.Vector<float>.Count;
+        if (System.Numerics.Vector.IsHardwareAccelerated && qSpan.Length >= simdLength)
+        {
+            var sumVector = System.Numerics.Vector<float>.Zero;
+            int limit = qSpan.Length - (qSpan.Length % simdLength);
+            for (; i < limit; i += simdLength)
+            {
+                var qVec = new System.Numerics.Vector<float>(qSpan.Slice(i, simdLength));
+                var bVec = new System.Numerics.Vector<float>(blobFloats.Slice(i, simdLength));
+                sumVector += qVec * bVec;
+            }
+            acc = System.Numerics.Vector.Dot(sumVector, System.Numerics.Vector<float>.One);
+        }
+        for (; i < qSpan.Length; i++)
+        {
+            acc += qSpan[i] * blobFloats[i];
+        }
+        return acc;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // Quiesce in-flight reads before freeing the native connection. Every
+        // read holds `_gate` for the whole time it touches `_connection`, so
+        // acquiring it here guarantees no thread-pool read is mid-query against
+        // the connection we're about to Dispose — otherwise the close frees it
+        // out from under the reader, a use-after-dispose native crash (mirror of
+        // macOS ReadStore F-C4-002). Reads ConfigureAwait(false) throughout and
+        // never re-enter the gate, so this can't self-deadlock.
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _connection?.Dispose();
+            _connection = null;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+        _gate.Dispose();
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // Sync mirror of DisposeAsync: block until any in-flight read releases
+        // the gate before freeing the native connection (see DisposeAsync).
+        _gate.Wait();
+        try
+        {
+            _connection?.Dispose();
+            _connection = null;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+        _gate.Dispose();
+    }
+}
+
+internal sealed record FileRow(
+    long Id,
+    string Path,
+    string Kind,
+    long SizeBytes,
+    double? ModifiedAt,
+    bool HasFaces,
+    bool HasText,
+    System.Collections.Generic.IReadOnlyList<string>? Tags = null,
+    string? ProposedName = null);
+
+internal sealed record FileRowWithScore(FileRow Row, float Score);
+
+/// <summary>one row of pending VLM-proposed rename, used to seed
+/// the Deep Analyze "Pending renames" bulk-apply sheet.</summary>
+internal sealed record ProposedRenameRow(
+    long Id,
+    string Path,
+    string ProposedName);

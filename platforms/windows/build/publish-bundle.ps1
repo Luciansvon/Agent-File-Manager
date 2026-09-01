@@ -1,0 +1,364 @@
+# FileID Windows — release publish + WiX Burn bundle.
+#
+# This is the canonical "I'm cutting a release" command. Produces ONE
+# downloadable artifact for end users: dist/installer/FileIDSetup.exe.
+#
+# What it chains:
+#   1. Toolchain probes (cargo, dotnet, MSVC ARM64 cl.exe, WiX v4 SDK)
+#   2. Cross-compile engine for both x86_64-pc-windows-msvc and aarch64-pc-windows-msvc
+#   3. dotnet publish FileID.App for both win-x64 and win-arm64 (self-contained, R2R)
+#   4. Stage FileIDEngine.exe alongside FileID.exe in each publish dir
+#   5. Sign every .exe + .dll under each publish dir (skipped via -SkipSign)
+#   6. Build per-arch MSIs (FileID-x64.msi + FileID-arm64.msi) via WiX
+#   7. Sign both MSIs
+#   8. Build Burn bundle (FileIDSetup.exe wrapping both MSIs)
+#   9. Sign FileIDSetup.exe (Burn re-attaches embedded MSIs after build,
+#      so the bundle MUST be signed AFTER its inner MSIs are signed,
+#      otherwise the embedded copies are unsigned)
+#  10. Smoke: bootstrapper exists, sized sanely, signature verifies
+#  11. Privacy gate: grep shipped binaries for telemetry strings
+#
+# Usage:
+#   pwsh build/publish-bundle.ps1 -SkipSign                 # local test build (no cert)
+#   pwsh build/publish-bundle.ps1 -SignThumbprint <SHA1>    # signed release build
+#   pwsh build/publish-bundle.ps1 -SkipArm64                # skip ARM64 (x64-only release)
+#
+# Final artifact: platforms/windows/dist/installer/FileIDSetup.exe.
+# Secondary artifacts (for IT admins): FileID-x64.msi + FileID-arm64.msi
+# in the same folder.
+
+param(
+    [switch]$SkipSign,
+    [string]$SignThumbprint = "",
+    [string]$TimestampServer = "http://timestamp.digicert.com",
+    [switch]$SkipArm64,
+    [switch]$SkipPrivacyGate
+)
+
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+
+# A release build must never bypass signing or the privacy gate. release.yml
+# sets CI_RELEASE=true on the actual signing path; if -SkipSign / -SkipPrivacyGate
+# slipped through there it would ship unsigned/unverified binaries to users —
+# exactly the failure these gates exist to prevent. Local dev builds (CI_RELEASE
+# unset) may still -SkipSign for cert-less iteration; a cert-less CI dry-run must
+# NOT set CI_RELEASE.
+if ($env:CI_RELEASE -eq 'true') {
+    if ($SkipSign) {
+        Write-Host "ERROR: -SkipSign is forbidden on a release build (would ship unsigned binaries)." -ForegroundColor Red
+        exit 1
+    }
+    if ($SkipPrivacyGate) {
+        Write-Host "ERROR: -SkipPrivacyGate is forbidden on a release build (would ship unverified binaries)." -ForegroundColor Red
+        exit 1
+    }
+}
+
+$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$PlatformDir = Resolve-Path (Join-Path $ScriptDir "..")
+$EngineDir   = Resolve-Path (Join-Path $PlatformDir "src/engine")
+$AppCsproj   = Join-Path $PlatformDir "src/FileID.App/FileID.App.csproj"
+$CoreCsproj  = Join-Path $PlatformDir "src/FolderVision.Core/FolderVision.Core.csproj"
+$Solution    = Join-Path $PlatformDir "FileID.sln"
+$MsiProj     = Join-Path $PlatformDir "installer/FileID.Msi/FileID.Msi.wixproj"
+$BundleProj  = Join-Path $PlatformDir "installer/FileID.Bundle/FileID.Bundle.wixproj"
+$DistDir     = Join-Path $PlatformDir "dist/installer"
+
+$AppTfm = "net8.0-windows10.0.19041.0"
+
+# Telemetry strings the privacy gate refuses to ship. Anything matching
+# any of these in the final shipped binaries fails the build.
+$ForbiddenTelemetryStrings = @(
+    # MUST stay in sync with .github/workflows/windows-engine.yml's
+    # privacy gate. Add to both lists when adding a new SDK marker.
+    "sentry.io",
+    "io.sentry",
+    "applicationinsights",
+    "applicationinsights.azure.com",
+    "googletagmanager",
+    "google-analytics.com",
+    "segment.io",
+    "segment.com",
+    "mixpanel.com",
+    "amplitude.com",
+    "posthog.com",
+    "datadoghq",
+    "bugsnag",
+    "rollbar.com",
+    "honeycomb.io",
+    "newrelic.com",
+    "raygun.io",
+    "firebase",
+    "firebaseio.com",
+    "appcenter.ms",
+    "in.appcenter.ms",
+    "crashpad",
+    "breakpad"
+)
+
+Write-Host "FileID release publish + bundle" -ForegroundColor Cyan
+Write-Host "  Skip ARM64:    $SkipArm64"
+Write-Host "  Skip sign:     $SkipSign"
+Write-Host "  Skip privacy:  $SkipPrivacyGate"
+Write-Host ""
+
+# ─── 1. Toolchain probes ────────────────────────────────────────────────────
+function Require-Command($name, $hint) {
+    if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+        Write-Host "ERROR: '$name' not found on PATH." -ForegroundColor Red
+        Write-Host "       $hint" -ForegroundColor Yellow
+        exit 1
+    }
+}
+
+Require-Command "cargo" "Install Rust via https://rustup.rs"
+Require-Command "dotnet" "winget install Microsoft.DotNet.SDK.8"
+
+if (-not $SkipArm64) {
+    $targets = & rustup target list --installed 2>$null
+    if ($targets -notcontains "aarch64-pc-windows-msvc") {
+        Write-Host "Adding rust target aarch64-pc-windows-msvc..." -ForegroundColor Yellow
+        & rustup target add aarch64-pc-windows-msvc
+    }
+    # Verify MSVC ARM64 toolchain is installed (cargo will fail cryptically without it).
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $arm64Cl = & $vswhere -find "VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe" 2>$null | Select-Object -First 1
+        if (-not $arm64Cl) {
+            Write-Host "WARN: MSVC ARM64 toolchain not detected. Install via:" -ForegroundColor Yellow
+            Write-Host "      winget install Microsoft.VisualStudio.2022.BuildTools --override `"--add Microsoft.VisualStudio.Component.VC.Tools.ARM64`"" -ForegroundColor Yellow
+            Write-Host "      Pass -SkipArm64 to bypass." -ForegroundColor Yellow
+        }
+    }
+}
+
+if (-not $SkipSign -and [string]::IsNullOrEmpty($SignThumbprint)) {
+    Write-Host "ERROR: -SignThumbprint <SHA1> required (or pass -SkipSign for unsigned local builds)." -ForegroundColor Red
+    exit 1
+}
+
+# ─── 2. Build engine for each arch ─────────────────────────────────────────
+function Build-Engine($triple) {
+    Write-Host "Building engine ($triple, release)..." -ForegroundColor Cyan
+    Push-Location $EngineDir
+    try { & cargo build --release --target $triple } finally { Pop-Location }
+}
+
+Build-Engine "x86_64-pc-windows-msvc"
+if (-not $SkipArm64) {
+    Build-Engine "aarch64-pc-windows-msvc"
+}
+
+# ─── 3. Publish app for each arch ──────────────────────────────────────────
+function Get-MSBuildPath {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $found = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+        if ($found -and (Test-Path $found)) {
+            return $found
+        }
+    }
+    $candidates = @(
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+        "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
+        "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
+function Publish-App($rid, $platform) {
+    Write-Host "Publishing FileID.App ($rid)..." -ForegroundColor Cyan
+    $msBuild = Get-MSBuildPath
+    if ($msBuild) {
+        Write-Host "Using MSBuild at: $msBuild" -ForegroundColor Gray
+        & $msBuild $AppCsproj /t:Publish /p:Configuration=Release /p:Platform=$platform /p:RuntimeIdentifier=$rid /p:SelfContained=true /p:PublishReadyToRun=true /nologo /restore
+    } else {
+        & dotnet publish $AppCsproj -c Release -r $rid --self-contained true /p:PublishReadyToRun=true -p:Platform=$platform --nologo
+    }
+}
+
+function Publish-Core($rid, $platform) {
+    Write-Host "Publishing FolderVision.Core ($rid, single-file)..." -ForegroundColor Cyan
+    $msBuild = Get-MSBuildPath
+    if ($msBuild) {
+        & $msBuild $CoreCsproj /t:Publish /p:Configuration=Release /p:Platform=$platform /p:RuntimeIdentifier=$rid /p:SelfContained=true /p:PublishSingleFile=true /nologo /restore
+    } else {
+        & dotnet publish $CoreCsproj -c Release -r $rid --self-contained true /p:PublishSingleFile=true -p:Platform=$platform --nologo
+    }
+}
+
+Publish-App "win-x64" "x64"
+Publish-Core "win-x64" "x64"
+if (-not $SkipArm64) {
+    Publish-App "win-arm64" "arm64"
+    Publish-Core "win-arm64" "arm64"
+}
+
+# ─── 4. Stage engine into each publish dir ─────────────────────────────────
+function Resolve-PublishDir($rid, $platform) {
+    return Join-Path $PlatformDir "src/FileID.App/bin/$platform/Release/$AppTfm/$rid/publish"
+}
+
+function Resolve-CorePublishDir($rid, $platform) {
+    return Join-Path $PlatformDir "src/FolderVision.Core/bin/$platform/Release/$AppTfm/$rid/publish"
+}
+
+function Resolve-EngineExe($triple) {
+    return Join-Path $EngineDir "target/$triple/release/FileIDEngine.exe"
+}
+
+function Stage-Engine($triple, $rid, $platform) {
+    $src = Resolve-EngineExe $triple
+    $dst = Resolve-PublishDir $rid $platform
+    if (-not (Test-Path $src)) { throw "Missing engine binary: $src" }
+    if (-not (Test-Path $dst)) { throw "Missing publish dir: $dst" }
+    Copy-Item $src (Join-Path $dst "FileIDEngine.exe") -Force
+}
+
+function Stage-Core($rid, $platform) {
+    $src = Join-Path (Resolve-CorePublishDir $rid $platform) "FolderVision.Core.exe"
+    $dst = Resolve-PublishDir $rid $platform
+    if (-not (Test-Path $src)) { throw "Missing Core binary: $src" }
+    if (-not (Test-Path $dst)) { throw "Missing app publish dir: $dst" }
+    Copy-Item $src (Join-Path $dst "FolderVision.Core.exe") -Force
+}
+
+Stage-Engine "x86_64-pc-windows-msvc" "win-x64" "x64"
+Stage-Core "win-x64" "x64"
+if (-not $SkipArm64) {
+    Stage-Engine "aarch64-pc-windows-msvc" "win-arm64" "arm64"
+    Stage-Core "win-arm64" "arm64"
+}
+
+# ─── 5. Sign published binaries ────────────────────────────────────────────
+function Sign-Binary($path) {
+    if ($SkipSign) { return }
+    & signtool sign /fd SHA256 /tr $TimestampServer /td SHA256 /sha1 $SignThumbprint $path | Out-Null
+    # signtool's failures (expired/absent cert, timestamp-server timeout, denied
+    # access) are non-fatal to the pipe unless we check $LASTEXITCODE — without
+    # this the script sails on and ships an UNSIGNED bundle that trips SmartScreen
+    # on every user's machine. Mirrors sign.ps1's per-target check.
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: signtool failed (exit $LASTEXITCODE) for $path — refusing to ship a partially-signed bundle." -ForegroundColor Red
+        exit 1
+    }
+}
+
+function Sign-PublishDir($dir) {
+    if ($SkipSign) { return }
+    Write-Host "Signing binaries under $dir..." -ForegroundColor Cyan
+    $files = Get-ChildItem -Path $dir -Recurse -Include *.exe, *.dll
+    foreach ($f in $files) {
+        Sign-Binary $f.FullName
+    }
+}
+
+Sign-PublishDir (Resolve-PublishDir "win-x64" "x64")
+if (-not $SkipArm64) {
+    Sign-PublishDir (Resolve-PublishDir "win-arm64" "arm64")
+}
+
+# ─── 6. Build per-arch MSIs ────────────────────────────────────────────────
+New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+
+Write-Host "Building FileID-x64.msi..." -ForegroundColor Cyan
+& dotnet build $MsiProj -c Release -p:Platform=x64 --nologo
+
+if (-not $SkipArm64) {
+    Write-Host "Building FileID-arm64.msi..." -ForegroundColor Cyan
+    & dotnet build $MsiProj -c Release -p:Platform=arm64 --nologo
+}
+
+# ─── 7. Sign MSIs ──────────────────────────────────────────────────────────
+$MsiX64   = Join-Path $DistDir "FileID-x64.msi"
+$MsiArm64 = Join-Path $DistDir "FileID-arm64.msi"
+Sign-Binary $MsiX64
+if (-not $SkipArm64) { Sign-Binary $MsiArm64 }
+if ($SkipArm64 -and -not (Test-Path $MsiArm64)) {
+    Copy-Item $MsiX64 $MsiArm64
+}
+
+# ─── 8. Build Burn bundle ──────────────────────────────────────────────────
+Write-Host "Building FileIDSetup.exe (Burn bundle)..." -ForegroundColor Cyan
+& dotnet build $BundleProj -c Release --nologo
+
+$BundleExe = Join-Path $DistDir "FileIDSetup.exe"
+if (-not (Test-Path $BundleExe)) {
+    Write-Host "ERROR: Bundle not produced at $BundleExe" -ForegroundColor Red
+    exit 1
+}
+
+# ─── 9. Sign bundle ────────────────────────────────────────────────────────
+# Burn re-attaches the embedded MSIs after the bundle is built; the bundle
+# itself MUST be re-signed last so the outer Authenticode signature is
+# valid AFTER the embedded MSIs are stamped in. WiX docs call this out
+# explicitly — `insignia` is the tool but signtool on the final .exe works.
+Sign-Binary $BundleExe
+
+# ─── 10. Smoke ─────────────────────────────────────────────────────────────
+$bundleSize = [math]::Round((Get-Item $BundleExe).Length / 1MB, 1)
+Write-Host ""
+Write-Host "Smoke checks:" -ForegroundColor Cyan
+Write-Host ("  FileIDSetup.exe       OK ({0} MB)" -f $bundleSize) -ForegroundColor Green
+$msiSize = [math]::Round((Get-Item $MsiX64).Length / 1MB, 1)
+Write-Host ("  FileID-x64.msi        OK ({0} MB)" -f $msiSize) -ForegroundColor Green
+if (-not $SkipArm64) {
+    $msiSize = [math]::Round((Get-Item $MsiArm64).Length / 1MB, 1)
+    Write-Host ("  FileID-arm64.msi      OK ({0} MB)" -f $msiSize) -ForegroundColor Green
+}
+
+if (-not $SkipSign) {
+    $sig = Get-AuthenticodeSignature $BundleExe
+    if ($sig.Status -ne "Valid") {
+        Write-Host "ERROR: Bundle signature status is $($sig.Status)" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  Authenticode          OK (signed by $($sig.SignerCertificate.Subject))" -ForegroundColor Green
+
+    # The bundle being Valid doesn't prove the inner MSIs are signed — a
+    # half-signed set still trips SmartScreen + WinVerifyTrust after install.
+    # Verify every shipped MSI too (the publish-dir exes are signed via
+    # Sign-PublishDir above; the MSIs are the user-facing secondary artifacts).
+    $msis = @($MsiX64)
+    if (-not $SkipArm64) { $msis += $MsiArm64 }
+    foreach ($msi in $msis) {
+        $ms = Get-AuthenticodeSignature $msi
+        if ($ms.Status -ne "Valid") {
+            Write-Host "ERROR: MSI signature status is $($ms.Status) for $msi" -ForegroundColor Red
+            exit 1
+        }
+    }
+    Write-Host "  Authenticode (MSIs)   OK" -ForegroundColor Green
+}
+
+# ─── 11. Privacy gate ──────────────────────────────────────────────────────
+if (-not $SkipPrivacyGate) {
+    Write-Host ""
+    Write-Host "Privacy gate: scanning shipped binaries..." -ForegroundColor Cyan
+    $privacyPy = Join-Path (Split-Path (Split-Path (Split-Path $ScriptDir -Parent) -Parent) -Parent) "shared\scripts\check_binary_privacy.py"
+    $publishDirs = @((Resolve-PublishDir "win-x64" "x64"))
+    if (-not $SkipArm64) {
+        $publishDirs += (Resolve-PublishDir "win-arm64" "arm64")
+    }
+    foreach ($d in $publishDirs) {
+        & python $privacyPy $d
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Privacy gate failed for $d" -ForegroundColor Red
+            exit 1
+        }
+    }
+    Write-Host "  Privacy gate          OK (zero telemetry strings)" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host "Release artifacts staged under:" -ForegroundColor Green
+Write-Host "  $DistDir\FileIDSetup.exe   ← canonical user-facing download"
+Write-Host "  $DistDir\FileID-x64.msi    ← for IT admins (SCCM/Intune)"
+if (-not $SkipArm64) {
+    Write-Host "  $DistDir\FileID-arm64.msi  ← for IT admins (Snapdragon WoA)"
+}

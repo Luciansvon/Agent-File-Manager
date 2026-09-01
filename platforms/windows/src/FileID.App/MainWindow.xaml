@@ -1,0 +1,163 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    MainWindow — root window. LavaLamp behind everything; sidebar | divider |
+    detail in a horizontal split; drag-drop overlay laid on top of the
+    content row.
+
+    The drag-drop overlay only renders when DragOver is in flight; ditto a
+    "drop a folder to scan" message.
+-->
+<Window
+    x:Class="FileID.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:motion="using:FileID.Theme.Motion"
+    xmlns:sidebar="using:FileID.Views.Sidebar"
+    xmlns:views="using:FileID.Views"
+    Title="Folder Vision AI"
+    mc:Ignorable="d">
+
+    <Grid x:Name="RootLayout">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="32" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- LavaLamp via pure Microsoft.UI.Composition (no Win2D).
+             Composition is the right primitive: vsync-driven, GPU-resident,
+             no extra render target, no Win2D dep, and avoids the Win2D +
+             CoreMessagingXP interaction that breaks on Win11 26200+. -->
+        <motion:LavaLampBackground Grid.RowSpan="2" />
+
+        <!-- AppTitleBar: a transparent drag-region backdrop. Passed to
+             SetTitleBar() so its full bounds are draggable / double-click-
+             to-maximize. Must remain EMPTY of interactive children — any
+             Button inside this Grid would consume pointer events and break
+             window dragging. Visible chrome (icon, app name) lives in the
+             sibling Grid below with IsHitTestVisible=False so pointer
+             events pass through to the drag region. The sidebar toggle
+             button sits in its own sibling so it stays clickable without
+             eating drag events from the rest of the title bar. -->
+        <Grid x:Name="AppTitleBar"
+              Grid.Row="0"
+              Background="Transparent" />
+
+        <!-- Sidebar toggle button: hit-testable sibling overlay. Only the
+             button's own 32×24 bounds capture pointer events; everything
+             outside it falls through to AppTitleBar and drags the window. -->
+        <Button x:Name="SidebarToggleButton"
+                Grid.Row="0"
+                Click="OnSidebarToggleClicked"
+                Background="Transparent"
+                BorderThickness="0"
+                Padding="8,4"
+                Width="32" Height="24"
+                Margin="6,0,0,0"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                AutomationProperties.Name="Toggle sidebar"
+                ToolTipService.ToolTip="Toggle sidebar (Ctrl+Shift+S)">
+            <FontIcon x:Name="SidebarToggleGlyph"
+                      FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                      Glyph="&#xE700;"
+                      FontSize="14"
+                      AutomationProperties.AccessibilityView="Raw" />
+        </Button>
+
+        <!-- App icon + name: visible but hit-test-invisible so window-drag
+             events on this area fall through to AppTitleBar below. -->
+        <StackPanel Grid.Row="0"
+                    Orientation="Horizontal"
+                    VerticalAlignment="Center"
+                    Margin="44,0,0,0"
+                    IsHitTestVisible="False">
+            <Image Source="ms-appx:///Assets/Logo/FileID-16.png"
+                   Width="16" Height="16"
+                   VerticalAlignment="Center"
+                   Margin="0,0,8,0" />
+            <TextBlock Text="Folder Vision AI"
+                       VerticalAlignment="Center"
+                       FontSize="13"
+                       FontWeight="SemiBold"
+                       Opacity="0.55" />
+        </StackPanel>
+
+        <Grid Grid.Row="1"
+              AllowDrop="True"
+              DragOver="OnDragOver"
+              DragLeave="OnDragLeave"
+              Drop="OnDrop">
+            <Grid.ColumnDefinitions>
+                <!-- bracket the sidebar with MinWidth/MaxWidth so
+                     it can't squeeze the detail pane on narrow windows or
+                     stretch absurdly on ultra-wide monitors. -->
+                <ColumnDefinition x:Name="SidebarColumn"
+                                  Width="260"
+                                  MinWidth="240"
+                                  MaxWidth="320" />
+                <ColumnDefinition Width="1" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <sidebar:Sidebar x:Name="SidebarHost" Grid.Column="0" />
+
+            <Border Grid.Column="1"
+                    Background="{ThemeResource SurfaceBorderBrush}" />
+
+            <Grid x:Name="DetailHost" Grid.Column="2">
+                <views:DetailHostView />
+            </Grid>
+        </Grid>
+
+        <!-- WelcomeSheet host. Confined to Row 1 ONLY so the
+             title bar (Row 0) stays uncovered and draggable. Previously
+             the sheet was hosted inside a `ContentDialog`, which renders
+             a hit-testable full-window smoke layer over Row 0 too and
+             intercepted pointer events on the title bar — user could
+             see Welcome but couldn't drag the window. This inline
+             overlay carries its own dim background (matching the
+             dialog's smoke) but never covers the chrome row. -->
+        <Grid x:Name="WelcomeOverlay"
+              Grid.Row="1"
+              Background="#CC0D0D14"
+              Visibility="Collapsed">
+            <Border MaxWidth="720"
+                    MinWidth="580"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    CornerRadius="12"
+                    Background="{ThemeResource SolidBackgroundFillColorBaseBrush}"
+                    BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                    BorderThickness="1">
+                <ContentControl x:Name="WelcomeOverlayHost" />
+            </Border>
+        </Grid>
+
+        <!-- Drag-drop overlay (visible only while a drag is in flight) -->
+        <Grid x:Name="DragOverlay"
+              Grid.RowSpan="2"
+              Background="#990D0D14"
+              Visibility="Collapsed"
+              IsHitTestVisible="False">
+            <Border Padding="40,32"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    BorderThickness="2"
+                    BorderBrush="{ThemeResource GoldBrush}"
+                    CornerRadius="{StaticResource CornerRadiusL}"
+                    Background="{ThemeResource SurfaceBaseBrush}">
+                <StackPanel Spacing="12" HorizontalAlignment="Center">
+                    <FontIcon Glyph="&#xE8B7;" FontSize="48" Foreground="{ThemeResource GoldBrush}" />
+                    <TextBlock Text="Drop folder to scan"
+                               FontSize="20" FontWeight="SemiBold"
+                               HorizontalAlignment="Center" />
+                    <TextBlock Text="FileID will read every file inside, on this machine."
+                               FontSize="12" Opacity="0.65"
+                               HorizontalAlignment="Center" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

@@ -1,0 +1,93 @@
+# FileID Flatpak developer/store-preparation manifest.
+#
+# From the repository root:
+#   flatpak install -y --user flathub \
+#     org.gnome.Platform//49 org.gnome.Sdk//49 \
+#     org.freedesktop.Sdk.Extension.rust-stable//25.08
+#   flatpak-builder --user --force-clean --repo=repo \
+#     build-dir packaging/flatpak/io.github.fileid.FileID.yaml
+#
+# Cargo crates and ONNX Runtime are immutable manifest sources. The build
+# sandbox has no network access and Cargo is forced offline. Before Flathub
+# submission, replace the local `dir` sources with the immutable archive
+# of the audited release commit and regenerate cargo-sources.json from that
+# archive's platforms/linux/Cargo.lock.
+
+app-id: io.github.fileid.FileID
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: fileid-linux
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  - --share=network
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /man
+  - '*.a'
+  - '*.la'
+
+modules:
+  - name: fileid
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/fileid/cargo
+        ORT_LIB_LOCATION: /run/build/fileid/onnxruntime
+        ORT_SKIP_DOWNLOAD: '1'
+    build-commands:
+      - |
+        set -eu
+        rustc --version
+        cargo --version
+        test -f "$ORT_LIB_LOCATION/lib/libonnxruntime.a"
+        cd platforms/linux
+        cargo build --release --locked --offline
+        cargo build --release --locked --offline -p fileid-engine --bin FileIDEngine
+      - install -Dm755 platforms/linux/target/release/fileid-linux /app/bin/fileid-linux
+      - install -Dm755 platforms/linux/target/release/FileIDEngine /app/bin/FileIDEngine
+      - install -Dm644 platforms/linux/data/io.github.fileid.FileID.desktop /app/share/applications/io.github.fileid.FileID.desktop
+      - install -Dm644 platforms/linux/data/io.github.fileid.FileID.metainfo.xml /app/share/metainfo/io.github.fileid.FileID.metainfo.xml
+      - |
+        set -eu
+        for sz in 64 128 256 512; do
+          d="/app/share/icons/hicolor/${sz}x${sz}/apps"
+          mkdir -p "$d"
+          rsvg-convert -w "$sz" -h "$sz" \
+            platforms/linux/data/io.github.fileid.FileID.svg \
+            -o "$d/io.github.fileid.FileID.png"
+        done
+    sources:
+      - cargo-sources.json
+      - type: archive
+        only-arches: [x86_64]
+        url: https://cdn.pyke.io/0/pyke:ort-rs/ms@1.22.0/x86_64-unknown-linux-gnu.tgz
+        sha256: ed1716de95974bf47ab0223ca33734a0b5a5d09a181225d0e8ed62d070aea893
+        dest: onnxruntime
+      - type: archive
+        only-arches: [aarch64]
+        url: https://cdn.pyke.io/0/pyke:ort-rs/ms@1.22.0/aarch64-unknown-linux-gnu.tgz
+        sha256: 24e4760207136fc50b854bb5012ab81de6189039cf6d4fd3f5b8d3db7e929f1e
+        dest: onnxruntime
+      - type: dir
+        path: ../../platforms/linux
+        dest: platforms/linux
+        skip: [target]
+      - type: dir
+        path: ../../platforms/windows/src/engine
+        dest: platforms/windows/src/engine
+        skip: [target]
+      - type: dir
+        path: ../../shared
+        dest: shared

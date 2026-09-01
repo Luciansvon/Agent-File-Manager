@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Canonical AppStream metadata for the Linux app. SINGLE SOURCE — every
+     packaging channel (Flatpak, AppImage, Nix, AUR) installs THIS file to
+     /…/share/metainfo/, never a copy. Keep the <id> in lockstep with the
+     .desktop basename and the Flatpak app-id (io.github.fileid.FileID). -->
+<component type="desktop-application">
+  <id>io.github.fileid.FileID</id>
+
+  <name>FileID</name>
+  <summary>On-device AI file organizer</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+
+  <developer id="io.github.fileid">
+    <name>FileID</name>
+  </developer>
+
+  <description>
+    <p>
+      FileID tags, dedupes, restructures, and renames tens of thousands of files
+      locally — no cloud, no telemetry. Point it at a folder and on-device AI
+      sorts your photos, documents, and media: automatic content tags, face
+      grouping for people, duplicate and near-duplicate cleanup, deep document
+      analysis, and a butler-grade restructure that proposes a tidy folder tree
+      you can preview before applying.
+    </p>
+    <p>Everything runs on your machine:</p>
+    <ul>
+      <li>Library — search by filename, tag, or extracted text; grid preview.</li>
+      <li>People — face clustering into named persons.</li>
+      <li>Cleanup — exact and perceptual near-duplicate detection.</li>
+      <li>Deep Analyze — opt-in vision-language analysis; requires a compatible external llama-mtmd-cli and is not yet available in the Flatpak sandbox.</li>
+      <li>Restructure — preview a proposed folder tree, then move or symlink.</li>
+      <li>Settings — pick models, tune thresholds, manage the local library.</li>
+    </ul>
+    <p>
+      The only network egress is user-initiated AI model downloads from
+      huggingface.co. No analytics, crash reporting, or update pings — ever.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.fileid.FileID.desktop</launchable>
+
+  <categories>
+    <category>Utility</category>
+    <category>FileTools</category>
+  </categories>
+
+  <keywords>
+    <keyword>files</keyword>
+    <keyword>organizer</keyword>
+    <keyword>tags</keyword>
+    <keyword>photos</keyword>
+    <keyword>duplicates</keyword>
+    <keyword>ai</keyword>
+  </keywords>
+
+  <url type="homepage">https://github.com/WebWorldWide/FileID</url>
+  <url type="bugtracker">https://github.com/WebWorldWide/FileID/issues</url>
+  <url type="vcs-browser">https://github.com/WebWorldWide/FileID</url>
+
+  <!-- NOTE: no <screenshots> yet. appstreamcli compose (run by flatpak-builder)
+       downloads every <image> to validate it; a placeholder/unreachable URL
+       fails the whole compose ("file-read-error" → "filters-but-no-output").
+       Flathub submission requires >=1 reachable screenshot — add real hosted
+       captures of the Linux UI here before submitting; keeping the element out
+       entirely is valid AppStream and keeps the build green until then. -->
+
+  <content_rating type="oars-1.1"/>
+
+  <branding>
+    <color type="primary" scheme_preference="dark">#1a1a1f</color>
+    <color type="primary" scheme_preference="light">#ffcc00</color>
+  </branding>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-07">
+      <description>
+        <p>Fresh cross-platform functional baseline with all six native product areas, People naming and face reassignment parity, grounded Deep Analyze results, and native sleep inhibition for long-running scans.</p>
+      </description>
+    </release>
+    <release version="0.1.4" date="2026-08-03">
+      <description>
+        <p>The macOS scan sidebar now keeps counting, estimating, and time-left feedback visible throughout a scan. The macOS engine is packaged and launched as a background agent, preventing a second Dock application during local AI processing.</p>
+      </description>
+    </release>
+    <release version="0.1.3" date="2026-08-02">
+      <description>
+        <p>Face groups are no longer hidden by a size threshold. Merge suggestions reject people who appear together in the same photo, require per-pair review, and use the shared bounded engine path on Linux. Suggested-pair processing uses persisted centroids on macOS to reduce memory use, and stale suggestions are invalidated after every accepted merge.</p>
+      </description>
+    </release>
+    <release version="0.1.2" date="2026-07-30">
+      <description>
+        <p>People grouping and Restructure reliability. Faces are judged by pixel size instead of frame share, recovering real faces that were discarded; near-identical face groups now merge, so one person is no longer split across many groups; and People hides one-moment fragments while keeping every named group. Restructure Apply no longer abandons a whole batch over one changed file, states only the moves it will actually make, and keeps Undo available after a cancelled undo. Deep Analyze gains a folder-exclusion list.</p>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-07-11">
+      <description>
+        <p>Cross-platform release with hardened CLI/TUI workflows, packaging, and engine portability.</p>
+      </description>
+    </release>
+  </releases>
+</component>

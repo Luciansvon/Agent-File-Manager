@@ -1,0 +1,443 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    LibraryView — search bar + kind filter + thumbnail grid.
+
+ Same visual hierarchy:
+      - Top toolbar: search box (Ctrl+F focus), kind segmented control
+      - Grid: ItemsRepeater + UniformGridLayout, 256-px tiles
+      - Empty state: when no rows match the current query/filter
+
+-->
+<UserControl
+    x:Class="FileID.Views.Library.LibraryView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:vm="using:FileID.ViewModels"
+    xmlns:motion="using:FileID.Theme.Motion"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <!-- macOS Library binds Cmd+F to search-box focus, Esc to "clear
+         selection / clear search", Cmd+A to select-all, Cmd+Z to undo
+         the last destructive op. Mirror with Ctrl on Windows. The
+         accelerators are scoped to the UserControl so they fire from
+         anywhere on the page, not only from the search box. -->
+    <UserControl.KeyboardAccelerators>
+        <KeyboardAccelerator Modifiers="Control" Key="F" Invoked="OnFocusSearchAccelerator" />
+        <KeyboardAccelerator Modifiers="Control" Key="A" Invoked="OnSelectAllAccelerator" />
+        <KeyboardAccelerator Modifiers="Control" Key="Z" Invoked="OnUndoAccelerator" />
+        <KeyboardAccelerator Key="Escape" Invoked="OnEscapeAccelerator" />
+    </UserControl.KeyboardAccelerators>
+
+    <Grid Padding="32,32,32,24" RowSpacing="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Page header -->
+        <StackPanel Grid.Row="0" Spacing="4">
+            <TextBlock Text="AI Search" Style="{StaticResource TitleTextBlockStyle}"
+                       AutomationProperties.HeadingLevel="Level1" />
+            <TextBlock Text="Cari foto dan dokumen berdasarkan isi, teks OCR, atau nama file—tanpa scan ulang."
+                       Style="{StaticResource BodyTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       TextWrapping="Wrap" />
+        </StackPanel>
+
+        <!-- Toolbar: search + kind filter + Select-all-visible + Undo pill. -->
+        <Grid Grid.Row="1" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBox x:Name="SearchBox"
+                     Grid.Column="0"
+                     Height="36"
+                     PlaceholderText="Contoh: referensi kursi kayu minimalis — Ctrl+F"
+                     TextChanged="OnSearchChanged"
+                     AutomationProperties.Name="Search files"
+                    AutomationProperties.HelpText="Search across filenames, OCR text, extracted document content, and locally cached image descriptions"/>
+
+            <ComboBox x:Name="KindFilter"
+                      Grid.Column="1"
+                      Width="160"
+                      SelectionChanged="OnKindChanged"
+                      SelectedIndex="0"
+                      AutomationProperties.Name="Filter by file kind">
+                <ComboBoxItem Content="All kinds" Tag="all"/>
+                <ComboBoxItem Content="Images" Tag="image"/>
+                <ComboBoxItem Content="Videos" Tag="video"/>
+                <ComboBoxItem Content="Documents" Tag="doc"/>
+                <ComboBoxItem Content="PDFs" Tag="pdf"/>
+                <ComboBoxItem Content="Audio" Tag="audio"/>
+            </ComboBox>
+
+            <!-- explicit "Select all" affordance. macOS Library
+                 tab always exposes this so users don't have to discover
+                 Ctrl+Click. Toggling fills the selection bar; clicking
+                 again clears. -->
+            <Button x:Name="SelectAllButton"
+                    Grid.Column="2"
+                    Click="OnSelectAllClicked"
+                    ToolTipService.ToolTip="Select all visible files (Ctrl+A)"
+                    AutomationProperties.Name="Select all visible files"
+                    AutomationProperties.HelpText="Selects every visible file; toggles to clear the selection (Ctrl+A)">
+                <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <FontIcon Glyph="&#xE762;" FontSize="13" />
+                    <TextBlock x:Name="SelectAllText" Text="Select" />
+                </StackPanel>
+            </Button>
+
+            <!-- Undo-last-rename header button. Hidden when the
+                 UndoStack is empty; shows a tappable pill with the last
+                 destructive op's label when entries exist. -->
+            <Button x:Name="UndoButton"
+                    Grid.Column="3"
+                    Click="OnUndoLastClicked"
+                    Visibility="Collapsed"
+                    ToolTipService.ToolTip="Undo last destructive action (Ctrl+Z)"
+                    AutomationProperties.Name="Undo last action"
+                    AutomationProperties.HelpText="Undoes the last destructive action such as rename, trash, tag, or restructure (Ctrl+Z)">
+                <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <FontIcon Glyph="&#xE7A7;" FontSize="13" />
+                    <TextBlock x:Name="UndoButtonText" Text="Undo" />
+                </StackPanel>
+            </Button>
+        </Grid>
+
+        <!-- Inline banners: CLIP-not-installed hint when the user types
+             a semantic query, Deep Analyze active banner when the engine
+             is captioning, face clustering banner when clustering is
+             running. Mirrors macOS LibraryView's banner stack. Collapses
+             cleanly when no banner applies. -->
+        <StackPanel Grid.Row="2" Spacing="6">
+            <Border x:Name="ClipMissingBanner"
+                    Visibility="Collapsed"
+                    CornerRadius="10"
+                    Padding="12,10"
+                    Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                    BorderBrush="{ThemeResource AiBrush}"
+                    BorderThickness="1">
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0" Glyph="&#xE721;" FontSize="14"
+                              Foreground="{ThemeResource AiBrush}"
+                              VerticalAlignment="Top" Margin="0,1,0,0" />
+                    <TextBlock Grid.Column="1" TextWrapping="Wrap"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Text="Pencarian teks lokal tetap aktif. Pencarian visual lintas bahasa belum diaktifkan; pemasangan model hanya dilakukan dari Settings dengan persetujuanmu." />
+                </Grid>
+            </Border>
+            <Border x:Name="DeepAnalyzeBanner"
+                    Visibility="Collapsed"
+                    CornerRadius="10"
+                    Padding="12,10"
+                    Background="{ThemeResource GoldSelectedBackgroundBrush}"
+                    BorderBrush="{ThemeResource GoldBrush}"
+                    BorderThickness="1">
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <ProgressRing Grid.Column="0" IsActive="True" Width="16" Height="16"
+                                  Foreground="{ThemeResource GoldBrush}" VerticalAlignment="Center" />
+                    <TextBlock Grid.Column="1"
+                               x:Name="DeepAnalyzeBannerText"
+                               VerticalAlignment="Center"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               TextTrimming="CharacterEllipsis"
+                               Text="Deep Analyze running…" />
+                </Grid>
+            </Border>
+            <Border x:Name="FaceClusteringBanner"
+                    Visibility="Collapsed"
+                    CornerRadius="10"
+                    Padding="12,10"
+                    Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                    BorderBrush="{ThemeResource AiBrush}"
+                    BorderThickness="1">
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <ProgressRing Grid.Column="0" IsActive="True" Width="16" Height="16"
+                                  Foreground="{ThemeResource AiBrush}" VerticalAlignment="Center" />
+                    <TextBlock Grid.Column="1" VerticalAlignment="Center"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Text="Grouping faces into people clusters…" />
+                </Grid>
+            </Border>
+        </StackPanel>
+
+        <!-- Selection toolbar — visible when at least one tile is selected. -->
+        <Grid Grid.Row="3"
+              x:Name="SelectionBar"
+              Visibility="Collapsed"
+              ColumnSpacing="10"
+              Padding="14,10"
+              CornerRadius="10"
+              Background="{ThemeResource AccentFillColorTertiaryBrush}"
+              BorderBrush="{ThemeResource AccentFillColorDefaultBrush}"
+              BorderThickness="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       x:Name="SelectionCountText"
+                       VerticalAlignment="Center"
+                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+            <Button Grid.Column="1" Click="OnTagSelectedClicked"
+                    ToolTipService.ToolTip="Apply tags to selected files"
+                    AutomationProperties.Name="Tag selected files">
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <FontIcon Glyph="&#xE8EC;" FontSize="13"/>
+                    <TextBlock Text="Tag…"/>
+                </StackPanel>
+            </Button>
+            <Button Grid.Column="2" Click="OnRenameSelectedClicked"
+                    ToolTipService.ToolTip="Rename selected files"
+                    AutomationProperties.Name="Rename selected files">
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <FontIcon Glyph="&#xE8AC;" FontSize="13"/>
+                    <TextBlock Text="Rename…"/>
+                </StackPanel>
+            </Button>
+            <Button Grid.Column="3" Click="OnTrashSelectedClicked"
+                    ToolTipService.ToolTip="Move selected files to the Recycle Bin"
+                    AutomationProperties.Name="Move selected files to the Recycle Bin">
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <FontIcon Glyph="&#xE74D;" FontSize="13"/>
+                    <TextBlock Text="Trash…"/>
+                </StackPanel>
+            </Button>
+            <Button Grid.Column="4" Click="OnClearSelectionClicked"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    ToolTipService.ToolTip="Clear selection (Esc)"
+                    AutomationProperties.Name="Clear selection">
+                <FontIcon Glyph="&#xE894;" FontSize="13"/>
+            </Button>
+        </Grid>
+
+        <!-- Grid of tiles. IsTabStop so Tab can land focus on the grid and
+             arrow-key navigation (OnGridPreviewKeyDown) takes over; a tile
+             click also routes focus here. -->
+        <ScrollViewer x:Name="GridScroller"
+                      Grid.Row="4"
+                      IsTabStop="True"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      ZoomMode="Disabled">
+            <ItemsRepeater x:Name="Repeater"
+                           ItemsSource="{x:Bind ViewModel.Items, Mode=OneWay}"
+                           ElementPrepared="OnRepeaterElementPrepared"
+                           ElementClearing="OnRepeaterElementClearing">
+                <!-- Dense square gallery. Metadata appears on hover instead of
+                     reserving a permanent caption row below every thumbnail. -->
+                <ItemsRepeater.Layout>
+                    <UniformGridLayout MinItemWidth="148"
+                                       MinItemHeight="148"
+                                       MinRowSpacing="6"
+                                       MinColumnSpacing="6"
+                                       ItemsStretch="Fill"/>
+                </ItemsRepeater.Layout>
+
+                <ItemsRepeater.ItemTemplate>
+                    <DataTemplate x:DataType="vm:FileTile">
+                        <!-- PointerEntered/Exited drive a subtle scale and
+                             reveal metadata. SizeChanged keeps the tile square
+                             after the repeater computes its real column width. -->
+                        <Grid x:Name="TileRoot"
+                              CornerRadius="8"
+                              Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                              BorderThickness="1"
+                              Padding="0"
+                              SizeChanged="OnTileSizeChanged"
+                              Tag="{x:Bind Path}"
+                              Tapped="OnTileTapped"
+                              RightTapped="OnTileRightTapped"
+                              DoubleTapped="OnTileDoubleTapped"
+                              CanDrag="True"
+                              DragStarting="OnTileDragStarting"
+                              PointerEntered="OnTilePointerEntered"
+                              PointerExited="OnTilePointerExited"
+                              ToolTipService.ToolTip="{x:Bind Path}"
+                              AutomationProperties.Name="{x:Bind FileName}"
+                              AutomationProperties.HelpText="Click to view file details and preview, or right-tap for more actions">
+                            <!-- Inline so each tile gets a unique animatable instance.
+                                 macOS LibraryView.swift:676-677 ramps stroke opacity
+                                 0.08 → 0.18 on hover (easeOut 0.18s). -->
+                            <Grid.BorderBrush>
+                                <SolidColorBrush Color="White" Opacity="0.08" />
+                            </Grid.BorderBrush>
+                            <Grid.ContextFlyout>
+                                <MenuFlyout>
+                                    <MenuFlyoutItem Text="Open"
+                                                    Click="OnContextOpen"
+                                                    Tag="{x:Bind Path}">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE8E5;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Show in Explorer"
+                                                    Click="OnContextReveal"
+                                                    Tag="{x:Bind Path}">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE838;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Find similar"
+                                                    Click="OnContextFindSimilar"
+                                                    Tag="{x:Bind Id}"
+                                                    ToolTipService.ToolTip="Search for visually similar images via CLIP">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE721;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutSeparator/>
+                                    <MenuFlyoutItem Text="Copy path"
+                                                    Click="OnContextCopyPath"
+                                                    Tag="{x:Bind Path}">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE8C8;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                </MenuFlyout>
+                            </Grid.ContextFlyout>
+                            <Border
+                                    Background="{ThemeResource SubtleFillColorTertiaryBrush}"
+                                    CornerRadius="8">
+                                <Grid>
+                                    <!-- Shimmer placeholder while
+                                         thumbnail loads. ShowShimmer is
+                                         Thumbnail==null && !ThumbnailFailed
+                                         so the shimmer cedes to the
+                                         broken-image placeholder when
+                                         the fallback chain returns null. -->
+                                    <motion:ShimmerView
+                                        Visibility="{x:Bind ShowShimmer, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"/>
+                                    <!-- The Image keeps its default Opacity=1 and just
+                                         renders its bound Source. No ImageOpened handler:
+                                         it never fired for pre-decoded / L1-cached
+                                         BitmapImages (so any opacity logic gated on it was
+                                         dead), and the tile-root entrance (scale-only) is
+                                         what carries the reveal. ShowShimmer is the load
+                                         indicator; ThumbnailFailed shows the broken glyph. -->
+                                    <Image Source="{x:Bind Thumbnail, Mode=OneWay}"
+                                           Stretch="UniformToFill"
+                                           HorizontalAlignment="Stretch"
+                                           VerticalAlignment="Stretch" />
+                                    <!-- Broken-image placeholder when
+                                         ThumbnailService.RequestAsync
+                                         returns null after exhausting its
+                                         fallback chain. Procedural FontIcon
+                                         so no Assets bookkeeping. -->
+                                    <FontIcon Glyph="&#xE91F;"
+                                              FontSize="48"
+                                              Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                              HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"
+                                              Visibility="{x:Bind ThumbnailFailed, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                </Grid>
+                            </Border>
+                            <Border
+                                    BorderBrush="{ThemeResource AccentFillColorDefaultBrush}"
+                                    BorderThickness="3"
+                                    CornerRadius="8"
+                                    Visibility="{x:Bind IsSelected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                            <FontIcon
+                                      Glyph="&#xE73E;"
+                                      FontSize="22"
+                                      HorizontalAlignment="Right"
+                                      VerticalAlignment="Top"
+                                      Margin="0,4,4,0"
+                                      Foreground="{ThemeResource AccentFillColorDefaultBrush}"
+                                      Visibility="{x:Bind IsSelected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                            <!-- Hover badges: kind + face cluster + OCR text indicators top-left.
+                                 Kind badge first so the "what is this file" answer reads
+                                 left-to-right even when face/OCR badges are absent. -->
+                            <StackPanel
+                                        Orientation="Horizontal"
+                                        Spacing="4"
+                                        HorizontalAlignment="Left"
+                                        VerticalAlignment="Top"
+                                        Margin="4,4,0,0">
+                                <Border Padding="4,2"
+                                        CornerRadius="4"
+                                        Background="{ThemeResource TileScrimBrush}"
+                                        ToolTipService.ToolTip="{x:Bind KindDisplay}">
+                                    <FontIcon Glyph="{x:Bind KindBadgeGlyph}" FontSize="12" Foreground="White" />
+                                </Border>
+                                <Border Padding="4,2"
+                                        CornerRadius="4"
+                                        Background="{ThemeResource TileScrimBrush}"
+                                        Visibility="{x:Bind HasText, Converter={StaticResource BoolToVisibility}}">
+                                    <FontIcon Glyph="&#xE8C1;" FontSize="12" Foreground="{ThemeResource AiBrush}" />
+                                </Border>
+                            </StackPanel>
+                            <Border x:Name="HoverMetadata"
+                                    VerticalAlignment="Bottom"
+                                    Padding="10,22,10,9"
+                                    Opacity="0"
+                                    IsHitTestVisible="False"
+                                    CornerRadius="0,0,8,8">
+                                <Border.Background>
+                                    <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                        <GradientStop Color="#00101014" Offset="0" />
+                                        <GradientStop Color="#E6101014" Offset="1" />
+                                    </LinearGradientBrush>
+                                </Border.Background>
+                                <StackPanel Spacing="2">
+                                    <TextBlock Text="{x:Bind FileName}"
+                                               FontSize="12"
+                                               FontWeight="SemiBold"
+                                               Foreground="White"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{x:Bind ProposedName, Mode=OneWay}"
+                                               FontSize="11"
+                                               Foreground="{ThemeResource GoldBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               Visibility="{x:Bind HasProposedName, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                    <TextBlock Text="{x:Bind SizeDisplay}"
+                                               FontSize="10"
+                                               Foreground="#CCFFFFFF" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </DataTemplate>
+                </ItemsRepeater.ItemTemplate>
+            </ItemsRepeater>
+        </ScrollViewer>
+
+        <!-- Status footer: loading + error. -->
+        <StackPanel Grid.Row="5"
+                    Orientation="Horizontal"
+                    Spacing="12"
+                    Visibility="{x:Bind FooterVisibility, Mode=OneWay}">
+            <ProgressRing IsActive="{x:Bind ViewModel.IsLoading, Mode=OneWay}"
+                          Width="16" Height="16"/>
+            <TextBlock Text="{x:Bind StatusText, Mode=OneWay}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+        </StackPanel>
+    </Grid>
+</UserControl>

@@ -1,0 +1,434 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    WelcomeSheet — first-launch onboarding modal. 1:1 port of
+    platforms/apple/app/Sources/FileID/Views/WelcomeSheet.swift.
+
+    Layout matches macOS verbatim:
+      VStack(alignment: .leading, spacing: 18) { header; Divider 0.3;
+        modelRow x3; Spacer 4; footer }.padding(28).frame(width: 600)
+
+    All FontIcon glyphs use numeric XML escapes (&#xE896;) so the bytes
+    survive any source-control / editor encoding pass; raw glyph chars
+    don't. Per-row state flows via x:Bind OneWay against
+    ModelInstallerService.Instance.{Clip,Arcface,Vlm} — no polling timer,
+    no manual widget mutation.
+-->
+<UserControl
+    x:Class="FileID.Views.WelcomeSheet"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:svc="using:FileID.Services"
+    mc:Ignorable="d"
+    Width="600">
+
+    <Grid Padding="28">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <ScrollViewer Grid.Row="0"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      Padding="0,0,4,0">
+            <StackPanel Spacing="18">
+
+                <!-- Header. macOS: VStack(spacing: 6) { title; body } -->
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Welcome to FileID"
+                               Style="{StaticResource TitleLargeTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level1" />
+                    <TextBlock Text="Install the AI models below to enable semantic search, face clustering, and Deep Analyze. Each model downloads once from HuggingFace and runs locally on your hardware."
+                               Style="{StaticResource BodyTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               TextWrapping="Wrap" />
+                </StackPanel>
+
+                <!-- Divider with 0.3 opacity to match macOS Divider().opacity(0.3). -->
+                <Rectangle Height="1"
+                           HorizontalAlignment="Stretch"
+                           Fill="{ThemeResource ControlStrokeColorDefaultBrush}"
+                           Opacity="0.3" />
+
+                <!-- CLIP — powers free-text semantic image search AND
+                     scan-time zero-shot scene tagging. -->
+                <Grid Padding="0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="28" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="{x:Bind GlyphFor(Svc.Clip.Status), Mode=OneWay}"
+                              Foreground="{x:Bind IconBrushFor(Svc.Clip.Status), Mode=OneWay}"
+                              FontSize="22"
+                              VerticalAlignment="Top"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <StackPanel Grid.Column="1" Spacing="4" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="Semantic search (CLIP ViT-B/32)"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Grid.Column="1"
+                                       Text="{x:Bind VlmSize(Svc.Clip.ApproxBytes), Mode=OneWay}"
+                                       Margin="12,0,0,0"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                        <TextBlock Text="Type queries like 'sunset at the beach' — FileID ranks every photo by visual relevance."
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <ProgressBar Maximum="1"
+                                     Value="{x:Bind Svc.Clip.Fraction, Mode=OneWay}"
+                                     IsIndeterminate="{x:Bind IsStarting(Svc.Clip.Status, Svc.Clip.HasStarted), Mode=OneWay}"
+                                     Foreground="{StaticResource GoldBrush}"
+                                     Visibility="{x:Bind VisibleIfDownloading(Svc.Clip.Status), Mode=OneWay}" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind ProgressLabel(Svc.Clip.Message, Svc.Clip.Fraction, Svc.Clip.BytesDone, Svc.Clip.TotalBytes), Mode=OneWay}"
+                                   Visibility="{x:Bind VisibleIfDownloading(Svc.Clip.Status), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind RateEtaLabel(Svc.Clip.BytesPerSecond, Svc.Clip.EtaSeconds), Mode=OneWay}"
+                                   Visibility="{x:Bind ShowRateEta(Svc.Clip.Status, Svc.Clip.HasStarted), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{x:Bind ErrorLabel(Svc.Clip.LastError), Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="{x:Bind VisibleIfFailed(Svc.Clip.Status), Mode=OneWay}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Grid Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Top">
+                        <TextBlock Text="Installed"
+                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   VerticalAlignment="Center"
+                                   Visibility="{x:Bind VisibleIfInstalled(Svc.Clip.Status), Mode=OneWay}" />
+                        <Button Click="OnClipActionClicked"
+                                Content="{x:Bind ButtonLabel(Svc.Clip.Status), Mode=OneWay}"
+                                MinWidth="86"
+                                AutomationProperties.HelpText="Semantic search (CLIP) model"
+                                Visibility="{x:Bind ShowActionButton(Svc.Clip.Status), Mode=OneWay}" />
+                    </Grid>
+                </Grid>
+
+                <!-- RAM++ — in-scan auto-tagging (4,585-concept multi-label
+                     ONNX). Gates onboarding completion alongside CLIP/Face/VLM. -->
+                <Grid Padding="0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="28" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="{x:Bind GlyphFor(Svc.RamPlus.Status), Mode=OneWay}"
+                              Foreground="{x:Bind IconBrushFor(Svc.RamPlus.Status), Mode=OneWay}"
+                              FontSize="22"
+                              VerticalAlignment="Top"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <StackPanel Grid.Column="1" Spacing="4" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="Auto-tagging (RAM++)"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Grid.Column="1"
+                                       Text="{x:Bind VlmSize(Svc.RamPlus.ApproxBytes), Mode=OneWay}"
+                                       Margin="12,0,0,0"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                        <TextBlock Text="Tags every image with thousands of everyday concepts so search and filters work the moment a scan finishes."
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <ProgressBar Maximum="1"
+                                     Value="{x:Bind Svc.RamPlus.Fraction, Mode=OneWay}"
+                                     IsIndeterminate="{x:Bind IsStarting(Svc.RamPlus.Status, Svc.RamPlus.HasStarted), Mode=OneWay}"
+                                     Foreground="{StaticResource GoldBrush}"
+                                     Visibility="{x:Bind VisibleIfDownloading(Svc.RamPlus.Status), Mode=OneWay}" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind ProgressLabel(Svc.RamPlus.Message, Svc.RamPlus.Fraction, Svc.RamPlus.BytesDone, Svc.RamPlus.TotalBytes), Mode=OneWay}"
+                                   Visibility="{x:Bind VisibleIfDownloading(Svc.RamPlus.Status), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind RateEtaLabel(Svc.RamPlus.BytesPerSecond, Svc.RamPlus.EtaSeconds), Mode=OneWay}"
+                                   Visibility="{x:Bind ShowRateEta(Svc.RamPlus.Status, Svc.RamPlus.HasStarted), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{x:Bind ErrorLabel(Svc.RamPlus.LastError), Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="{x:Bind VisibleIfFailed(Svc.RamPlus.Status), Mode=OneWay}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Grid Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Top">
+                        <TextBlock Text="Installed"
+                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   VerticalAlignment="Center"
+                                   Visibility="{x:Bind VisibleIfInstalled(Svc.RamPlus.Status), Mode=OneWay}" />
+                        <Button Click="OnRamPlusActionClicked"
+                                Content="{x:Bind ButtonLabel(Svc.RamPlus.Status), Mode=OneWay}"
+                                MinWidth="86"
+                                AutomationProperties.HelpText="Auto-tagging (RAM++) model"
+                                Visibility="{x:Bind ShowActionButton(Svc.RamPlus.Status), Mode=OneWay}" />
+                    </Grid>
+                </Grid>
+
+                <!-- ArcFace — Face recognition. -->
+                <Grid Padding="0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="28" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="{x:Bind GlyphFor(Svc.Arcface.Status), Mode=OneWay}"
+                              Foreground="{x:Bind IconBrushFor(Svc.Arcface.Status), Mode=OneWay}"
+                              FontSize="22"
+                              VerticalAlignment="Top"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <StackPanel Grid.Column="1" Spacing="4" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="Face recognition (YuNet + SFace)"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Grid.Column="1"
+                                       Text="{x:Bind VlmSize(Svc.Arcface.ApproxBytes), Mode=OneWay}"
+                                       Margin="12,0,0,0"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                        <TextBlock Text="On-device face detection (YuNet) + recognition (SFace), Apache-2.0. Clusters faces into named people."
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <ProgressBar Maximum="1"
+                                     Value="{x:Bind Svc.Arcface.Fraction, Mode=OneWay}"
+                                     IsIndeterminate="{x:Bind IsStarting(Svc.Arcface.Status, Svc.Arcface.HasStarted), Mode=OneWay}"
+                                     Foreground="{StaticResource GoldBrush}"
+                                     Visibility="{x:Bind VisibleIfDownloading(Svc.Arcface.Status), Mode=OneWay}" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind ProgressLabel(Svc.Arcface.Message, Svc.Arcface.Fraction, Svc.Arcface.BytesDone, Svc.Arcface.TotalBytes), Mode=OneWay}"
+                                   Visibility="{x:Bind VisibleIfDownloading(Svc.Arcface.Status), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind RateEtaLabel(Svc.Arcface.BytesPerSecond, Svc.Arcface.EtaSeconds), Mode=OneWay}"
+                                   Visibility="{x:Bind ShowRateEta(Svc.Arcface.Status, Svc.Arcface.HasStarted), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{x:Bind ErrorLabel(Svc.Arcface.LastError), Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="{x:Bind VisibleIfFailed(Svc.Arcface.Status), Mode=OneWay}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Grid Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Top">
+                        <TextBlock Text="Installed"
+                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   VerticalAlignment="Center"
+                                   Visibility="{x:Bind VisibleIfInstalled(Svc.Arcface.Status), Mode=OneWay}" />
+                        <Button Click="OnArcfaceActionClicked"
+                                Content="{x:Bind ButtonLabel(Svc.Arcface.Status), Mode=OneWay}"
+                                MinWidth="86"
+                                AutomationProperties.HelpText="Face recognition (YuNet + SFace) model"
+                                Visibility="{x:Bind ShowActionButton(Svc.Arcface.Status), Mode=OneWay}" />
+                    </Grid>
+                </Grid>
+
+                <!-- Qwen 2.5-VL — Deep Analyze (hardware-tiered 3B / 7B, set by
+                     ModelInstallerService.UpdateDeepVlmRecommendation). -->
+                <Grid Padding="0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="28" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="{x:Bind GlyphFor(Svc.DeepVlm.Status), Mode=OneWay}"
+                              Foreground="{x:Bind IconBrushFor(Svc.DeepVlm.Status), Mode=OneWay}"
+                              FontSize="22"
+                              VerticalAlignment="Top"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <StackPanel Grid.Column="1" Spacing="4" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="{x:Bind VlmTitle(Svc.DeepVlm.DisplayLabel), Mode=OneWay}"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Grid.Column="1"
+                                       Text="{x:Bind VlmSize(Svc.DeepVlm.ApproxBytes), Mode=OneWay}"
+                                       Margin="12,0,0,0"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                        <TextBlock Text="On-device vision model for Deep Analyze — captions photos, PDFs, and video keyframes and writes smart filenames. Sized to this PC."
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <ProgressBar Maximum="1"
+                                     Value="{x:Bind Svc.DeepVlm.Fraction, Mode=OneWay}"
+                                     IsIndeterminate="{x:Bind IsStarting(Svc.DeepVlm.Status, Svc.DeepVlm.HasStarted), Mode=OneWay}"
+                                     Foreground="{StaticResource GoldBrush}"
+                                     Visibility="{x:Bind VisibleIfDownloading(Svc.DeepVlm.Status), Mode=OneWay}" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind ProgressLabel(Svc.DeepVlm.Message, Svc.DeepVlm.Fraction, Svc.DeepVlm.BytesDone, Svc.DeepVlm.TotalBytes), Mode=OneWay}"
+                                   Visibility="{x:Bind VisibleIfDownloading(Svc.DeepVlm.Status), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind RateEtaLabel(Svc.DeepVlm.BytesPerSecond, Svc.DeepVlm.EtaSeconds), Mode=OneWay}"
+                                   Visibility="{x:Bind ShowRateEta(Svc.DeepVlm.Status, Svc.DeepVlm.HasStarted), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{x:Bind ErrorLabel(Svc.DeepVlm.LastError), Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="{x:Bind VisibleIfFailed(Svc.DeepVlm.Status), Mode=OneWay}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Grid Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Top">
+                        <TextBlock Text="Installed"
+                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   VerticalAlignment="Center"
+                                   Visibility="{x:Bind VisibleIfInstalled(Svc.DeepVlm.Status), Mode=OneWay}" />
+                        <Button Click="OnDeepVlmActionClicked"
+                                Content="{x:Bind ButtonLabel(Svc.DeepVlm.Status), Mode=OneWay}"
+                                MinWidth="86"
+                                AutomationProperties.HelpText="Deep Analyze vision model"
+                                Visibility="{x:Bind ShowActionButton(Svc.DeepVlm.Status), Mode=OneWay}" />
+                    </Grid>
+                </Grid>
+
+                <!-- GPU Acceleration Pack. Adaptive per-vendor;
+                     ModelInstallerService.UpdateAcceleratorForVendor sets
+                     the status + message based on EngineClient.Info.Hardware.GpuVendor. -->
+                <Grid Padding="0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="28" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="{x:Bind AcceleratorGlyph(Svc.Accelerator.Status, Svc.AcceleratorIsRealInstall), Mode=OneWay}"
+                              Foreground="{x:Bind AcceleratorIconBrush(Svc.Accelerator.Status, Svc.AcceleratorIsRealInstall), Mode=OneWay}"
+                              FontSize="22"
+                              VerticalAlignment="Top"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <StackPanel Grid.Column="1" Spacing="4" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0"
+                                       Text="{x:Bind Svc.Accelerator.DisplayLabel, Mode=OneWay}"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Grid.Column="1"
+                                       Text="{x:Bind AcceleratorSize(Svc.Accelerator.ApproxBytes, Svc.Accelerator.Status, Svc.AcceleratorIsRealInstall), Mode=OneWay}"
+                                       Margin="12,0,0,0"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                        <TextBlock Text="{x:Bind Svc.Accelerator.Message, Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <ProgressBar Maximum="1"
+                                     Value="{x:Bind Svc.Accelerator.Fraction, Mode=OneWay}"
+                                     IsIndeterminate="{x:Bind IsStarting(Svc.Accelerator.Status, Svc.Accelerator.HasStarted), Mode=OneWay}"
+                                     Foreground="{StaticResource GoldBrush}"
+                                     Visibility="{x:Bind VisibleIfDownloading(Svc.Accelerator.Status), Mode=OneWay}" />
+                        <TextBlock FontFamily="Consolas"
+                                   FontSize="11"
+                                   Text="{x:Bind RateEtaLabel(Svc.Accelerator.BytesPerSecond, Svc.Accelerator.EtaSeconds), Mode=OneWay}"
+                                   Visibility="{x:Bind ShowRateEta(Svc.Accelerator.Status, Svc.Accelerator.HasStarted), Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{x:Bind ErrorLabel(Svc.Accelerator.LastError), Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                                   Visibility="{x:Bind VisibleIfFailed(Svc.Accelerator.Status), Mode=OneWay}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Grid Grid.Column="2" Margin="14,0,0,0" VerticalAlignment="Top">
+                        <TextBlock Text="Installed"
+                                   Foreground="{ThemeResource SystemFillColorSuccessBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   VerticalAlignment="Center"
+                                   Visibility="{x:Bind ShowAcceleratorInstalledBadge(Svc.Accelerator.Status, Svc.AcceleratorIsRealInstall), Mode=OneWay}" />
+                        <Button Click="OnAcceleratorActionClicked"
+                                Content="{x:Bind ButtonLabel(Svc.Accelerator.Status), Mode=OneWay}"
+                                MinWidth="86"
+                                AutomationProperties.HelpText="GPU Acceleration Pack"
+                                Visibility="{x:Bind ShowAcceleratorButton(Svc.Accelerator.Status, Svc.AcceleratorIsRealInstall), Mode=OneWay}" />
+                    </Grid>
+                </Grid>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Footer: caption text + Install all + Skip/Done. macOS:
+             HStack { Text(caption2 tertiary); Spacer; "Install all"
+             borderedProminent goldTint disabled(allInstalled||installAllRequested);
+             "Skip for now"/"Done" bordered }. -->
+        <!-- 22 DIP top gap matches macOS: outer VStack(spacing:18) + Spacer(minLength:4) -->
+        <Grid Grid.Row="1" Margin="0,22,0,0" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       Text="Skip and install later from Settings → AI Models."
+                       FontSize="11"
+                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                       VerticalAlignment="Center"
+                       TextWrapping="Wrap" />
+            <Button Grid.Column="1"
+                    x:Name="InstallAllButton"
+                    Click="OnInstallAllClicked"
+                    Style="{StaticResource GoldButtonStyle}"
+                    IsEnabled="{x:Bind InstallAllEnabled(Svc.AllInstalled, Svc.IsBusy), Mode=OneWay}"
+                    Height="32"
+                    MinWidth="100">
+                <TextBlock Text="Install all" FontWeight="SemiBold" />
+            </Button>
+            <Button Grid.Column="2"
+                    Click="OnSkipClicked"
+                    Content="{x:Bind SkipLabel(Svc.AllInstalled), Mode=OneWay}"
+                    Height="32"
+                    MinWidth="100" />
+        </Grid>
+    </Grid>
+</UserControl>

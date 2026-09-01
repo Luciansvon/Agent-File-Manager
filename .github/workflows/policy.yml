@@ -1,0 +1,38 @@
+name: Repository policy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  action-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Test action pin policy
+        run: python shared/scripts/test_check_workflow_action_pins.py
+      - name: Enforce immutable action pins
+        run: python shared/scripts/check_workflow_action_pins.py
+      - name: Test workflow permission policy
+        run: python shared/scripts/test_check_workflow_permissions.py
+      - name: Enforce least-privilege workflow permissions
+        run: python shared/scripts/check_workflow_permissions.py
+      - name: Test bootstrap supply-chain policy
+        run: python shared/scripts/test_check_bootstrap_supply_chain.py
+      - name: Enforce bootstrap source pins
+        run: python shared/scripts/check_bootstrap_supply_chain.py
+      - name: Test runtime egress release gate
+        run: python shared/scripts/test_check_runtime_egress.py
+      - name: Reject unreviewed runtime egress additions
+        run: python shared/scripts/check_runtime_egress.py --known-blockers
+      - name: Enforce current documentation contracts
+        run: python shared/scripts/check_current_docs.py
+      - name: Test model license policy
+        run: python shared/scripts/test_check_model_license_policy.py
+      - name: Enforce reviewed model license policy
+        run: python shared/scripts/check_model_license_policy.py

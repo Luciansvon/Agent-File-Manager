@@ -1,0 +1,93 @@
+name: Packaging (Linux — Flatpak)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/**'
+      - 'platforms/linux/**'
+      - 'platforms/windows/src/engine/**'
+      - 'shared/scripts/check_binary_privacy.py'
+      - 'shared/scripts/test_check_binary_privacy.py'
+      - '.github/workflows/packaging.yml'
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - 'platforms/linux/**'
+      - 'platforms/windows/src/engine/**'
+      - 'shared/scripts/check_binary_privacy.py'
+      - 'shared/scripts/test_check_binary_privacy.py'
+      - '.github/workflows/packaging.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flatpak:
+    name: Flatpak (GNOME 49) — x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Verify generated offline Cargo sources
+        run: |
+          set -euo pipefail
+          python packaging/flatpak/generate-cargo-sources.py --check
+          python packaging/flatpak/test_generate_cargo_sources.py
+
+      - name: Install flatpak + flatpak-builder
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+
+      - name: Add Flathub remote
+        run: |
+          flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Install GNOME 49 runtime + Rust SDK extension
+        run: |
+          set -euo pipefail
+          flatpak install -y --user flathub \
+            org.gnome.Platform//49 \
+            org.gnome.Sdk//49 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
+
+      - name: Build the Flatpak without build-network access
+        run: |
+          set -euo pipefail
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --repo=repo \
+            build-dir \
+            packaging/flatpak/io.github.fileid.FileID.yaml
+
+      - name: Privacy scan exact Flatpak payload
+        run: |
+          set -euo pipefail
+          python3 shared/scripts/check_binary_privacy.py \
+            build-dir/files/bin/fileid-linux \
+            build-dir/files/bin/FileIDEngine
+
+      - name: Bundle the .flatpak
+        run: |
+          set -euo pipefail
+          flatpak build-bundle repo FileID.flatpak io.github.fileid.FileID
+          sha256sum FileID.flatpak > FileID.flatpak.sha256
+          sha256sum --check FileID.flatpak.sha256
+
+      - name: Upload Flatpak bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fileid-flatpak
+          path: |
+            FileID.flatpak
+            FileID.flatpak.sha256
+          if-no-files-found: error

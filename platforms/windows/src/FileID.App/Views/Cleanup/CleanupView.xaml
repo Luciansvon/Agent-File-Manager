@@ -1,0 +1,231 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    CleanupView — duplicate-group list with keeper selection.
+
+-->
+<UserControl
+    x:Class="FileID.Views.Cleanup.CleanupView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:vm="using:FileID.ViewModels"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid Padding="32,32,32,24" RowSpacing="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Spacing="4">
+                <TextBlock Text="Cleanup" Style="{StaticResource TitleTextBlockStyle}"
+                           AutomationProperties.HeadingLevel="Level1"/>
+                <TextBlock Text="Visually-similar files grouped by perceptual hash. Trashed items stay recoverable."
+                           Style="{StaticResource BodyTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           TextWrapping="Wrap" />
+                <!-- Live stats — "N groups • M files non-keepers • S reclaimable".
+                     Mirrors macOS CleanupView's header counter so the user
+                     can see what Trash non-keepers is about to do before
+                     they click. Updates whenever a keeper radio flips. -->
+                <TextBlock x:Name="HeaderStatsText"
+                           Text="{x:Bind HeaderStats, Mode=OneWay}"
+                           AutomationProperties.Name="{x:Bind HeaderStats, Mode=OneWay}"
+                           AutomationProperties.HelpText="Duplicate cleanup summary"
+                           FontSize="12"
+                           Foreground="{ThemeResource GoldBrush}" />
+            </StackPanel>
+            <ScrollViewer Grid.Column="1"
+                          HorizontalScrollMode="Auto"
+                          HorizontalScrollBarVisibility="Hidden"
+                          VerticalScrollMode="Disabled"
+                          VerticalScrollBarVisibility="Disabled">
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Button Click="OnResetKeepersClicked"
+                            AutomationProperties.Name="Reset keepers"
+                            AutomationProperties.HelpText="Re-mark the first member of every group as keeper, clearing any user overrides."
+                            ToolTipService.ToolTip="Re-mark the first member of every group as keeper, clearing any user overrides.">
+                        <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <FontIcon FontSize="13" Glyph="&#xE7A7;" />
+                            <TextBlock Text="Reset" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="OnTrashNonKeepersClicked"
+                            AutomationProperties.Name="Trash non-keepers"
+                            AutomationProperties.HelpText="Move every non-keeper duplicate to the Recycle Bin."
+                            ToolTipService.ToolTip="Move every non-keeper duplicate to the Recycle Bin.">
+                        <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <FontIcon FontSize="13" Glyph="&#xE74D;" />
+                            <TextBlock Text="Trash non-keepers" />
+                        </StackPanel>
+                    </Button>
+                    <Button Click="OnRefreshClicked"
+                            AutomationProperties.Name="Refresh duplicates"
+                            AutomationProperties.HelpText="Re-scan the database for byte-identical duplicate files."
+                            ToolTipService.ToolTip="Re-scan the database for byte-identical duplicate files.">
+                        <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <FontIcon FontSize="13" Glyph="&#xE72C;" />
+                            <TextBlock Text="Refresh" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+
+        <ScrollViewer Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+            <ItemsRepeater ItemsSource="{x:Bind ViewModel.Groups, Mode=OneWay}">
+                <ItemsRepeater.Layout>
+                    <StackLayout Orientation="Vertical" Spacing="8"/>
+                </ItemsRepeater.Layout>
+                <ItemsRepeater.ItemTemplate>
+                    <DataTemplate x:DataType="vm:DuplicateGroup">
+                        <Grid CornerRadius="12"
+                              Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                              BorderThickness="1"
+                              Padding="16"
+                              Tag="{x:Bind ContentHash}"
+                              AutomationProperties.Name="{x:Bind Caption, Mode=OneWay}"
+                              AutomationProperties.HelpText="Duplicate group. Right-click for keeper and trash actions."
+                              RightTapped="OnGroupRightTapped">
+                            <!-- Per-group right-click action menu.
+                                 RightTapped seeds the current-group cache so
+                                 MenuFlyoutItem clicks (which don't inherit
+                                 DataContext on WinUI 3) can resolve to the
+                                 correct DuplicateGroup. -->
+                            <Grid.ContextFlyout>
+                                <MenuFlyout>
+                                    <MenuFlyoutItem Text="Keep first"
+                                                    Click="OnGroupKeepFirst"
+                                                    ToolTipService.ToolTip="Mark only the first member as keeper.">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE73E;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Keep shallowest path"
+                                                    Click="OnGroupKeepShallowest"
+                                                    ToolTipService.ToolTip="Mark the copy in the least-nested folder as keeper.">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE8AB;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Invert keeper"
+                                                    Click="OnGroupInvert"
+                                                    ToolTipService.ToolTip="Pick the next member as keeper.">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE72C;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutSeparator />
+                                    <MenuFlyoutItem Text="Skip group"
+                                                    Click="OnGroupSkip"
+                                                    ToolTipService.ToolTip="Exclude this group from 'Trash non-keepers'.">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE894;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Unskip group"
+                                                    Click="OnGroupUnskip"
+                                                    ToolTipService.ToolTip="Re-include this group in 'Trash non-keepers'.">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE73E;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutSeparator />
+                                    <MenuFlyoutItem Text="Trash this group only"
+                                                    Click="OnGroupTrashNow"
+                                                    ToolTipService.ToolTip="Move every non-keeper member to the Recycle Bin.">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE74D;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                </MenuFlyout>
+                            </Grid.ContextFlyout>
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="{x:Bind Caption, Mode=OneWay}"
+                                           AutomationProperties.HeadingLevel="Level2"
+                                           Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                                <!-- Horizontal strip of thumbnail tiles (macOS CopyTile
+                                     parity). Thumbnails load lazily via the members
+                                     repeater's ElementPrepared (like LibraryView). -->
+                                <ScrollViewer HorizontalScrollMode="Auto"
+                                              HorizontalScrollBarVisibility="Auto"
+                                              VerticalScrollMode="Disabled"
+                                              VerticalScrollBarVisibility="Disabled">
+                                    <ItemsRepeater ItemsSource="{x:Bind Members}"
+                                                   ElementPrepared="OnMemberPrepared"
+                                                   ElementClearing="OnMemberClearing">
+                                        <ItemsRepeater.Layout>
+                                            <StackLayout Orientation="Horizontal" Spacing="10"/>
+                                        </ItemsRepeater.Layout>
+                                        <ItemsRepeater.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:DuplicateMember">
+                                                <StackPanel Width="140" Spacing="4" Padding="2"
+                                                            AutomationProperties.Name="{x:Bind FileName}"
+                                                            AutomationProperties.HelpText="{x:Bind Path}">
+                                                    <!-- Border clips the UniformToFill image to rounded corners. -->
+                                                    <Border Width="132" Height="132"
+                                                            CornerRadius="8"
+                                                            Background="{ThemeResource SubtleFillColorTertiaryBrush}">
+                                                        <Grid>
+                                                            <FontIcon Glyph="&#xEB9F;" FontSize="28"
+                                                                      Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                                      HorizontalAlignment="Center"
+                                                                      VerticalAlignment="Center"
+                                                                      Visibility="{x:Bind ShowPlaceholder, Mode=OneWay}" />
+                                                            <Image Source="{x:Bind Thumbnail, Mode=OneWay}"
+                                                                   Stretch="UniformToFill" />
+                                                        </Grid>
+                                                    </Border>
+                                                    <TextBlock Text="{x:Bind FileName}"
+                                                               Style="{StaticResource CaptionTextBlockStyle}"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               MaxLines="1"
+                                                               TextAlignment="Center"
+                                                               Width="132"
+                                                               ToolTipService.ToolTip="{x:Bind Path}" />
+                                                    <TextBlock Text="{x:Bind SizeDisplay}"
+                                                               Style="{StaticResource CaptionTextBlockStyle}"
+                                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                               HorizontalAlignment="Center" />
+                                                    <RadioButton GroupName="{x:Bind GroupKey, Mode=OneTime}"
+                                                                 IsChecked="{x:Bind IsKeeper, Mode=TwoWay}"
+                                                                 Content="Keep"
+                                                                 AutomationProperties.Name="{x:Bind FileName}"
+                                                                 AutomationProperties.HelpText="Keep this copy; trash the other duplicates in the group."
+                                                                 HorizontalAlignment="Center" />
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </ItemsRepeater.ItemTemplate>
+                                    </ItemsRepeater>
+                                </ScrollViewer>
+                            </StackPanel>
+                        </Grid>
+                    </DataTemplate>
+                </ItemsRepeater.ItemTemplate>
+            </ItemsRepeater>
+        </ScrollViewer>
+
+        <StackPanel Grid.Row="2"
+                    Orientation="Horizontal"
+                    Spacing="12"
+                    Visibility="{x:Bind FooterVisibility, Mode=OneWay}">
+            <ProgressRing IsActive="{x:Bind ViewModel.IsLoading, Mode=OneWay}"
+                          AutomationProperties.Name="Scanning for duplicates"
+                          Width="16" Height="16"/>
+            <TextBlock Text="{x:Bind StatusText, Mode=OneWay}"
+                       AutomationProperties.Name="{x:Bind StatusText, Mode=OneWay}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+        </StackPanel>
+    </Grid>
+</UserControl>

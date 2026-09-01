@@ -1,0 +1,350 @@
+[package]
+name = "fileid-engine"
+# Canonical product version lives in platforms/windows/VERSION; the engine
+# mirrors it here because Cargo can't read an external file without a build
+# script (no new deps) and exposes its own version via CARGO_PKG_VERSION
+# (main.rs / hardware.rs). Keep in sync — the MSI build (FileID.Msi.wixproj)
+# cross-checks this literal against VERSION and fails the build on drift.
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "FileID engine — owns DB, scan pipeline, ML inference. Spawned as a child of the FileID app and talks newline-delimited JSON over stdio."
+# License choice is pending the public-release decision; the engine is
+# `publish = false` so cargo doesn't enforce a SPDX expression. Update
+# this to "MIT" / "Apache-2.0" / proprietary text before any external
+# distribution. Tracked in shared/docs/SHIP.md.
+license = "TBD"
+publish = false
+
+[lib]
+name = "fileid_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "FileIDEngine"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + bounded channels.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "signal", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-channel = "2"
+parking_lot = "0.12"
+
+# Serialization — IPC protocol, settings, structured logs.
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64     = "0.22"
+uuid       = { version = "1", features = ["v4", "serde"] }
+# 0.4.20+ for RUSTSEC-2020-0071 / RUSTSEC-2020-0159 (panic-on-invalid-timestamp + localtime_r soundness).
+chrono     = { version = "0.4.20", features = ["serde"] }
+
+# SQLite. Bundled libsqlite3 + FTS5 for byte-faithful schema parity.
+rusqlite = { version = "0.31", features = ["bundled", "blob", "chrono", "limits", "modern_sqlite"] }
+# FTS5 ships in `bundled` since rusqlite 0.31; explicit feature flag isn't needed but documented here.
+
+# Logs — structured local-only tracing. Replaces JSONLog.swift. NEVER goes off-device.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender   = "0.2"
+
+# Errors.
+anyhow    = "1"
+thiserror = "1"
+
+# Filesystem walk + path utilities. Faster than std::fs::read_dir at scale.
+walkdir   = "2"
+# Parallel directory walk — rayon-backed, dramatically faster than walkdir
+# on NVMe (single-thread walkdir tops out ~50K stat/s; jwalk scales to
+# millions on 8+ cores with stat parallelism). MIT-licensed (deny.toml).
+jwalk     = "0.8"
+
+# CPU/system info for worker count + memory probes.
+num_cpus  = "1"
+sysinfo   = "0.30"
+
+# HTTP — only network surface, used by downloader.rs for HuggingFace model fetches.
+# rustls-tls so we don't pull openssl. http2 for parallel range-GETs.
+# rustls-tls-native-roots is reachable ONLY via the FILEID_DISABLE_TLS_PINNING=1
+# escape hatch: pinned builds disable built-in roots entirely, but the escape
+# hatch must trust the OS store (corporate-proxy interception CAs live there,
+# not in the compiled-in webpki bundle, so webpki-only would make the hatch
+# useless for its audience).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "http2"] }
+futures-util = "0.3"
+
+# Hex / SHA256 for model integrity verification.
+sha2 = "0.10"
+hex  = "0.4"
+# BLAKE3 content hashing for rename/move detection (Phase 3 identity). Faster
+# than SHA-256 on commodity CPUs, pure-Rust + SIMD (no C/C++ build dep). See
+# shared/docs/DECISIONS.md.
+blake3 = "1"
+
+# Image pipeline. image-rs covers JPEG/PNG/WebP/TIFF; HEIC would need
+# libheif-rs separately.
+image            = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
+kamadak-exif     = "0.5"
+# turbojpeg considered + dropped: requires a system libjpeg-turbo install
+# (no `vendored` feature upstream). The system-dep cost beats the JPEG-decode
+# speedup for the "user just downloads and runs" promise. Revisit when a
+# pure-Rust SIMD JPEG decoder lands.
+
+# Memory mapping for large image reads.
+memmap2 = "0.9"
+
+# PDF rendering — PDF previews route through the C# side's Windows.Data.Pdf
+# (bundled in Windows 10+). pdfium-render is gated behind the `pdf-analyze`
+# feature for engine-side rasterization (Deep Analyze input).
+pdfium-render = { version = "0.8", optional = true }
+
+# Lock-free queues for the hottest hot paths if benchmarks justify it.
+crossbeam-channel = "0.5"
+
+# Pure-Rust approximate-nearest-neighbor (HNSW) for face-clustering and
+# CLIP/BGE semantic search above ~10 k vectors, where brute-force cosine
+# becomes the bottleneck. No C/C++ build dep (rejected `usearch` for that
+# reason — see shared/docs/DECISIONS.md). MIT/Apache-2.0.
+instant-distance = "0.6"
+
+# Zip extraction for the llama.cpp runtime + Performance Pack downloads,
+# AND Phase 4 OOXML document text extraction (.docx/.pptx/.xlsx are zip+xml).
+# `default-features = false` skips bzip2/zstd which we don't need.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Streaming XML pull-parser for Phase 4 OOXML text extraction. Pure-Rust,
+# tiny, MIT-licensed. The alternative (`xml-rs`) is heavier + DOM-oriented.
+quick-xml = "0.41"
+
+# Phase 5: pure-Rust audio metadata + decode (no Java/ffmpeg system dep). Used
+# to read artist/album/title/genre/year tags from mp3/flac/wav/ogg/m4a/aac so
+# audio files in the library get real content-style tag chips. MPL-2.0 (file-
+# level copyleft; fine for separate use). YAMNet sound-event tagging + Whisper
+# transcription are documented follow-ups (need offline ONNX conversion).
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "ogg", "vorbis", "aac", "isomp4", "pcm"] }
+
+# Native llama.cpp bindings (in-process VLM inference, no subprocess).
+# Off by default to keep CI build fast — adds ~150 MB build artifacts +
+# requires cmake at build time. Toggle via `cargo build --features vlm-native`.
+llama-cpp-2 = { version = "0.1", optional = true }
+
+# ONNX Runtime bindings + ndarray for tensor wrangling. Both pinned to
+# EXACT versions (no caret) because the 2.0 RC line had ABI churn between
+# rc.10 / rc.11 / rc.12. Exact pins prevent silent breakage on `cargo update`.
+#
+# `download-binaries` MUST be on so the ORT runtime DLLs (onnxruntime.dll
+# + DirectML.dll + onnxruntime_providers_shared.dll) ship in the build
+# output — without it, `Session::builder()` fails immediately for every
+# EP including DirectML/CPU. CUDA/OpenVINO/QNN feature gates stay enabled
+# so the session-creation API compiles; their EP DLLs are delivered
+# separately via Performance Packs.
+# `ort` moved to per-target deps so non-Windows builds don't pull `directml`.
+ort-sys = "=2.0.0-rc.10"
+ndarray = "0.16"
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "load-dynamic",
+    "download-binaries",
+    "ndarray",
+    "directml",
+    "cuda",
+    "openvino",
+    "qnn",
+] }
+# Windows-rs — IFileOperation, IFileOpenDialog, Windows.Media.Ocr (WinRT), IThumbnailProvider,
+# SetThreadExecutionState, WinVerifyTrust, Media Foundation IMFSourceReader, IPropertyStore,
+# Authenticode, GlobalMemoryStatusEx.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Storage_FileSystem",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Media_Ocr",
+    "Storage",
+    "Storage_Streams",
+    "Storage_FileProperties",
+    "Graphics_Imaging",
+    "Foundation",
+    "Foundation_Collections",
+] }
+windows-core = "0.58"
+
+# Non-Windows deps. ort with CPU + CUDA + OpenVINO (no DirectML).
+# libc for getppid() / parent-death detection in platform.rs.
+[target.'cfg(not(windows))'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "load-dynamic",
+    "download-binaries",
+    "ndarray",
+    "cuda",
+    "openvino",
+] }
+libc = "0.2"
+
+[features]
+# `pdf-analyze` is on by default so Deep Analyze handles PDFs out of the
+# box (pdfium-render bundles its own pre-built libpdfium for Windows x64
+# / arm64, no system dependency). The non-feature stub in
+# pipeline/deep_analyze.rs remains as a build-without-pdfium escape hatch
+# (e.g. for size-conscious CI smoke builds) — opt out with
+# `cargo build --no-default-features`.
+default = ["pdf-analyze"]
+# Native (in-process) llama.cpp VLM inference. Off by default to keep CI
+# build time low — adds ~150 MB build artifacts + needs cmake. Toggle via
+# `cargo build --features vlm-native --release`.
+vlm-native = ["dep:llama-cpp-2"]
+# Engine-side PDF rasterization via pdfium-render. Bundles a pre-built
+# pdfium DLL (~15 MB binary cost). Enabled in `default` above.
+pdf-analyze = ["dep:pdfium-render"]
+
+[dev-dependencies]
+# Property-based tests for pure-function invariants (path safety, dHash
+# determinism, HMAC roundtrip, zip extraction safety). Dev-only.
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+# Criterion micro-benchmarks. Dev-only. Bench targets under `benches/*.rs`
+# depend on the `fileid_engine` lib. default-features off keeps the build
+# minimal — no plotters/HTML report machinery in CI.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "tagging_hashes"
+harness = false
+
+[[bench]]
+name = "face_clustering_5k"
+harness = false
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+# panic = "unwind" (the default) on purpose, NOT "abort". The stdio loop
+# dispatches every IPC command handler on a bare `tokio::spawn` /
+# `spawn_blocking` (main.rs). Under unwind, a panic in one handler unwinds
+# just that task — tokio surfaces it as a JoinError and the engine keeps
+# serving other commands. Under "abort" the panic killed the whole process,
+# turning any reachable handler panic into a full-engine crash (B7). Do not
+# re-add panic = "abort".
+
+[profile.release-debuginfo]
+inherits = "release"
+debug    = "limited"
+strip    = "none"
+
+# Iteration-friendly release profile. Same opt-level=3 as release, but
+# parallel codegen + thin LTO instead of fat — drops compile time by
+# 40-60% on a multi-core box. Use this for `./build.sh -windows --fast`
+# during inner-loop iteration; switch back to plain `release` for ship
+# builds where the extra perf from fat LTO matters.
+[profile.release-fast]
+inherits      = "release"
+lto           = "thin"
+codegen-units = 16
+
+# Profile-guided optimization. Two-pass: build with
+# `RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data"` and run `iterate.ps1` on
+# a representative corpus, then rebuild with
+# `RUSTFLAGS="-Cprofile-use=/tmp/pgo-data/merged.profdata"`. Expected
+# ~8-15 % on CPU-bound paths. The instrument/use flag is set via RUSTFLAGS
+# at invocation time, not here.
+[profile.release-pgo]
+inherits      = "release"
+
+[profile.dev]
+opt-level = 1            # 0 is too slow for image-heavy hot paths even in dev
+debug     = true
+# Parallel codegen for dev too. Default is 256 since 1.78; documented
+# explicitly so a future bump in the rust toolchain can't silently change
+# our iteration speed.
+codegen-units = 256
+
+[profile.bench]
+inherits = "release"
+debug    = "limited"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_imports         = "warn"
+dead_code              = "warn"
+
+[lints.clippy]
+pedantic   = { level = "warn", priority = -1 }
+# Pragmatic exceptions — these fire constantly on idiomatic windows-rs / serde code.
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+must_use_candidate      = "allow"
+return_self_not_must_use = "allow"
+# Style-only pedantic rules that fire constantly across the codebase
+# without correctness value. Disabling these keeps the CI gate (`-D warnings`)
+# meaningful — the remaining pedantic checks are signal, not noise.
+uninlined_format_args   = "allow"  # `format!("{x}")` vs `format!("{}", x)` — style preference
+ignored_unit_patterns   = "allow"  # `_ = expr` vs `() = expr` — style preference
+too_many_lines          = "allow"  # function-length lint; orthogonal to readability
+too_many_arguments      = "allow"  # IPC dispatchers take many params by design
+similar_names           = "allow"  # `srcSlot`/`dstSlot`-style pair names are clearer than aliased
+cast_precision_loss     = "allow"  # we cast i32/u32 → f32 for byte-fractions; precision loss is acceptable
+cast_possible_truncation = "allow" # bounded-by-caps truncations are explicit
+cast_sign_loss          = "allow"  # mostly i64↔u64 for byte counts
+cast_lossless           = "allow"  # u32→u64 conversions are deliberate widening
+unnecessary_wraps       = "allow"  # `Option<T>` returns at IPC boundaries even when current code can't None
+struct_excessive_bools  = "allow"  # IPC payloads sometimes carry several bool flags
+unreadable_literal      = "allow"  # `1024 * 1024 * 1024` is more readable than `1_073_741_824`
+needless_pass_by_value  = "allow"  # tokio::spawn captures often want owned values
+doc_markdown            = "allow"  # doc-comment "missing backticks" style lint — non-correctness
+redundant_closure_for_method_calls = "allow"  # `|x| x.foo()` is sometimes clearer than `Foo::foo`
+needless_raw_string_hashes = "allow"  # `r#"..."#` vs `r"..."` — style preference
+items_after_statements  = "allow"  # const-after-let placement is fine for locality
+single_match_else       = "allow"  # `match { x => ..., _ => () }` style preference
+manual_let_else         = "allow"  # `let-else` vs early return — both clear
+doc_overindented_list_items = "allow"  # markdown indent style
+ptr_as_ptr              = "allow"  # ptr-as-ptr casts intentional in windows-rs interop
+borrow_as_ptr           = "allow"  # &x as *const _ pattern is idiomatic windows-rs
+ref_as_ptr              = "allow"  # same family
+needless_lifetimes      = "allow"  # explicit lifetimes are sometimes clearer than elided
+cast_possible_wrap      = "allow"  # u32→i32 conversions for SQLite parameter shape are deliberate
+map_unwrap_or           = "allow"  # `map().unwrap_or()` is at least as readable as `map_or()`
+manual_midpoint         = "allow"  # `(a + b) / 2` is fine where overflow is impossible
+manual_is_multiple_of   = "allow"  # `x % n == 0` is idiomatic Rust
+unchecked_duration_subtraction = "allow"  # call sites are within elapsed-time logic where subtrahend < minuend by construction (lint was renamed from unchecked_time_subtraction)
+redundant_closure       = "allow"  # readability sometimes wins over conciseness
+needless_continue       = "allow"  # explicit continue in long loops aids readability
+needless_range_loop     = "allow"  # range-loop with index is sometimes clearer than iter
+large_stack_arrays      = "allow"  # bounded fixed-size arrays for ML preprocessing
+single_char_pattern     = "allow"  # `.split(",")` is at least as clear as `.split(',')`
+ptr_eq                  = "allow"  # explicit raw-ptr equality in unsafe windows-rs blocks
+needless_borrow         = "allow"  # explicit & at call sites can aid review
+match_same_arms         = "allow"  # multiple-arm matches are sometimes a deliberate exhaustiveness check
+manual_range_contains   = "allow"  # `x >= lo && x < hi` is at least as clear as `(lo..hi).contains(&x)`
+type_complexity         = "allow"  # tokio + windows-rs types are necessarily complex
+items_after_test_module = "allow"  # we sometimes put helpers below `#[cfg(test)]` mod
+result_large_err        = "allow"  # anyhow::Error is intentionally large
+trivially_copy_pass_by_ref = "allow"  # explicit references at FFI boundaries can aid clarity
+many_single_char_names  = "allow"  # math + image-coord code uses `x`, `y`, `w`, `h`, `r`, `g`, `b` by convention
+struct_field_names      = "allow"  # IPC payloads' field names are dictated by the schema
+ptr_cast_constness      = "allow"  # const→mut casts in windows-rs IPropertyStore call sites are required by the API
+stable_sort_primitive   = "allow"  # `sort_unstable` is faster but `sort` is stable — semantics matter
+if_same_then_else       = "allow"  # rare; flagged sites are deliberate redundancy for clarity

@@ -1,0 +1,115 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SuggestedMergesSheet — modal listing pairs of clusters whose anchor
+    faces fall in the uncertain similarity band (0.45..0.70). Engine-side
+    `findMergeSuggestions` IPC computes the pairs; we render side-by-side
+    anchor faces + similarity %, with Merge / Different-people / Skip
+    buttons per pair.
+-->
+<UserControl
+    x:Class="FileID.Views.People.SuggestedMergesSheet"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:vm="using:FileID.ViewModels"
+    mc:Ignorable="d"
+    MinWidth="640"
+    MinHeight="440">
+
+    <Grid RowSpacing="14" Padding="4">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Spacing="6">
+            <TextBlock Style="{StaticResource SubtitleTextBlockStyle}"
+                       AutomationProperties.HeadingLevel="Level1"
+                       Text="Suggested merges" />
+            <TextBlock x:Name="HeaderText"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       TextWrapping="Wrap"
+                       Text="Pairs of clusters that look similar. Confirm a merge if they're the same person, or mark them different so we don't ask again." />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollMode="Disabled">
+            <ItemsRepeater x:Name="PairRepeater"
+                           ItemsSource="{x:Bind _rows, Mode=OneWay}">
+                <ItemsRepeater.Layout>
+                    <StackLayout Orientation="Vertical" Spacing="10" />
+                </ItemsRepeater.Layout>
+                <ItemsRepeater.ItemTemplate>
+                    <DataTemplate x:DataType="vm:MergeSuggestionVm">
+                        <Grid Padding="14,12,14,12"
+                              CornerRadius="12"
+                              Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                              BorderThickness="1"
+                              AutomationProperties.Name="{x:Bind Title}"
+                              Opacity="{x:Bind RowOpacity, Mode=OneWay}">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                <Border Width="72" Height="72" CornerRadius="72"
+                                        Background="{ThemeResource SubtleFillColorTertiaryBrush}"
+                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                                    <Image Source="{x:Bind SourceFaceImage, Mode=OneTime}"
+                                           Stretch="UniformToFill" Width="72" Height="72" />
+                                </Border>
+                                <FontIcon Glyph="&#xE8D4;" FontSize="14" Foreground="{ThemeResource AccentFillColorDefaultBrush}" VerticalAlignment="Center" Margin="2,0,2,0" />
+                                <Border Width="72" Height="72" CornerRadius="72"
+                                        Background="{ThemeResource SubtleFillColorTertiaryBrush}"
+                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                                    <Image Source="{x:Bind DestFaceImage, Mode=OneTime}"
+                                           Stretch="UniformToFill" Width="72" Height="72" />
+                                </Border>
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="1"
+                                        Margin="16,0,16,0"
+                                        VerticalAlignment="Center">
+                                <TextBlock Text="{x:Bind Title}"
+                                           Style="{StaticResource BodyStrongTextBlockStyle}"
+                                           TextWrapping="NoWrap"
+                                           TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="{x:Bind SimilarityText}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                           Margin="0,2,0,0" />
+                            </StackPanel>
+
+                            <Button Grid.Column="2"
+                                    Content="Different people"
+                                    Margin="0,0,8,0"
+                                    IsEnabled="{x:Bind ActionsEnabled, Mode=OneWay}"
+                                    AutomationProperties.HelpText="Mark this pair as different people so it isn't suggested again."
+                                    Click="OnDifferentClicked" />
+                            <Button Grid.Column="3"
+                                    Content="Merge"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    IsEnabled="{x:Bind ActionsEnabled, Mode=OneWay}"
+                                    AutomationProperties.HelpText="Merge this pair of clusters into one person."
+                                    Click="OnMergeClicked" />
+                        </Grid>
+                    </DataTemplate>
+                </ItemsRepeater.ItemTemplate>
+            </ItemsRepeater>
+        </ScrollViewer>
+
+        <TextBlock Grid.Row="2"
+                   x:Name="StatusText"
+                   Style="{StaticResource CaptionTextBlockStyle}"
+                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                   TextWrapping="Wrap" />
+    </Grid>
+</UserControl>

@@ -1,0 +1,290 @@
+name: Windows app (.NET)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platforms/windows/src/FileID.App/**'
+      - 'platforms/windows/src/FileID.Theme/**'
+      - 'platforms/windows/src/FileID.IpcSchema/**'
+      - 'platforms/windows/Directory.Packages.props'
+      - 'platforms/windows/Directory.Build.props'
+      - 'platforms/windows/FileID.sln'
+      - 'platforms/windows/global.json'
+      - 'shared/scripts/check_binary_privacy.py'
+      - 'shared/scripts/test_check_binary_privacy.py'
+      - '.github/workflows/windows-app.yml'
+  pull_request:
+    paths:
+      - 'platforms/windows/src/FileID.App/**'
+      - 'platforms/windows/src/FileID.Theme/**'
+      - 'platforms/windows/src/FileID.IpcSchema/**'
+      - 'platforms/windows/Directory.Packages.props'
+      - 'platforms/windows/Directory.Build.props'
+      - 'platforms/windows/FileID.sln'
+      - 'platforms/windows/global.json'
+      - 'shared/scripts/check_binary_privacy.py'
+      - 'shared/scripts/test_check_binary_privacy.py'
+      - '.github/workflows/windows-app.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build .NET app — ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x64
+            runner: windows-latest
+            arch: x64
+          - label: arm64
+            runner: windows-latest
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        working-directory: platforms/windows
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # V15.2.1: WinUI 3's MrtCore.PriGen targets require Visual Studio's
+      # AppxPackage MSBuild tooling (Microsoft.Build.Packaging.Pri.Tasks.dll).
+      # The standalone .NET SDK on windows-latest doesn't ship that DLL;
+      # it's only present after Visual Studio's UWP / Windows App SDK
+      # workload is installed. setup-msbuild exposes the runner's VS
+      # Build Tools install to dotnet build via PATH + MSBuildExtensionsPath.
+      - name: Setup MSBuild (VS WinUI tooling)
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Cache NuGet
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ matrix.arch }}-${{ hashFiles('platforms/windows/Directory.Packages.props') }}
+          restore-keys: |
+            nuget-${{ matrix.arch }}-
+
+      - name: Restore
+        # Restore with the matrix's RuntimeIdentifier so assets/lock files
+        # carry the right per-arch entries. SelfContained=true in the
+        # csproj implicitly resolves a RID; without an explicit one
+        # restore picks the host RID (win-x64), then later builds for
+        # the matrix arch fail NETSDK1032 (RID/PlatformTarget mismatch).
+        run: dotnet restore src/FileID.App/FileID.App.csproj /p:Platform=${{ matrix.arch }} /p:RuntimeIdentifier=win-${{ matrix.arch }}
+
+      - name: Build (Debug)
+        # Use msbuild instead of dotnet build so the VS WinUI tooling
+        # (PriGen, MRT, XAML compiler) on the GitHub runner is found.
+        # `dotnet build` only looks at the standalone .NET SDK layout
+        # which doesn't include the AppxPackage tasks DLL.
+        run: msbuild src/FileID.App/FileID.App.csproj -t:Build -p:Configuration=Debug -p:Platform=${{ matrix.arch }} -p:RuntimeIdentifier=win-${{ matrix.arch }} -m -restore:false
+        shell: pwsh
+
+      - name: Build (Release)
+        run: msbuild src/FileID.App/FileID.App.csproj -t:Build -p:Configuration=Release -p:Platform=${{ matrix.arch }} -p:RuntimeIdentifier=win-${{ matrix.arch }} -m -restore:false
+        shell: pwsh
+
+      - name: Publish (Release, self-contained)
+        # V15.2 — what users actually run. msbuild Publish target. Restore
+        # is included here (no -restore:false) so per-RID assets are
+        # resolved fresh for the publish output even if a prior build
+        # step cached different assets.
+        run: >
+          msbuild src/FileID.App/FileID.App.csproj
+          -t:Publish
+          -p:Configuration=Release
+          -p:Platform=${{ matrix.arch }}
+          -p:RuntimeIdentifier=win-${{ matrix.arch }}
+          -p:SelfContained=true
+          -p:PublishDir=bin/${{ matrix.arch }}/Release/net8.0-windows10.0.19041.0/win-${{ matrix.arch }}/publish/
+          -restore
+          -m
+        shell: pwsh
+
+      - name: Run all test projects
+        # V15.3: was IpcSchema-only with continue-on-error. Now runs every
+        # discoverable test project in Tests/, fails on red. Tests run on
+        # x64 only — ARM64 cross-building tests is rarely useful here.
+        # `dotnet test` triggers its own restore for the Tests/ projects;
+        # safe to run here because the x64 build is already complete.
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          if (Test-Path Tests) {
+            dotnet test FileID.IpcSchema.Tests/ -c Debug --verbosity minimal
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            dotnet test FileID.App.Tests/ -c Debug --verbosity minimal
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "No Tests/ directory; skipping."
+          }
+        working-directory: platforms/windows/Tests
+
+      # V15.3 Phase 6 gates moved AFTER the build: an earlier placement
+      # caused `dotnet format FileID.sln`'s solution-level restore to
+      # clobber the arch-specific obj/ assets written by the per-csproj
+      # restore step above, which then broke `Build (Debug) -restore:false`
+      # on x64. Running them after all builds + publish + test means
+      # they can't interfere with restore state.
+      - name: Format check (x64 only)
+        if: matrix.arch == 'x64'
+        run: dotnet format FileID.sln --verify-no-changes
+
+      - name: Charset — UTF-8 BOM on .cs/.xaml (x64 only)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        # CLAUDE.md convention: .cs/.xaml ship as UTF-8 WITH a BOM. `dotnet format`
+        # enforces it for .cs but NOT .xaml, so a .xaml could silently drop the BOM
+        # (3 had — normalized in this commit). Fail the build if any does, so the
+        # charset contract can't drift back.
+        run: |
+          $files = Get-ChildItem -Path src -Recurse -Include *.cs,*.xaml -File |
+            Where-Object { $_.FullName -notmatch '[\\/](obj|bin)[\\/]' }
+          $bad = @()
+          foreach ($f in $files) {
+            $b = [System.IO.File]::ReadAllBytes($f.FullName)
+            if ($b.Length -lt 3 -or $b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) { $bad += $f.FullName }
+          }
+          if ($bad.Count -gt 0) {
+            Write-Host "::error::$($bad.Count) .cs/.xaml file(s) missing the required UTF-8 BOM:"
+            $bad | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "Charset OK: $($files.Count) .cs/.xaml files all UTF-8 BOM."
+
+      # Privacy gate — outbound-URL allowlist over the APP source. Parity with
+      # windows-engine.yml's source-URL scan: that scan globs all of
+      # platforms/windows/src (incl. app .cs/.xaml) but only RUNS when an
+      # engine-path change triggers windows-engine.yml — an app-only PR would
+      # bypass it. This step closes that gap so app-only changes are
+      # URL-scanned too. The allowlist + loopback exemption MUST stay in sync
+      # with windows-engine.yml (see shared/docs/DECISIONS.md to add a host).
+      - name: Privacy — source URL allowlist scan (x64 only)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $allowedHosts = @(
+            "huggingface.co",
+            "github.com",
+            "developer.download.nvidia.com",
+            "developer.nvidia.com",
+            "docs.nvidia.com",
+            "ai.google.dev",
+            "schemas.microsoft.com",
+            "schemas.openxmlformats.org"
+          )
+          $sources = Get-ChildItem -Path src -Recurse -File `
+            -Include *.cs,*.xaml,*.xaml.cs |
+            Where-Object { $_.FullName -notmatch '\\(bin|obj|target|packages)\\' }
+          # Loopback is exempt: a 127.0.0.1 / localhost URL never leaves the
+          # machine (matches windows-engine.yml's rationale, DECISIONS V16.20).
+          $loopbackHosts = @("127.0.0.1", "localhost", "0.0.0.0", "::1")
+          $hits = @()
+          foreach ($file in $sources) {
+            $content = Get-Content -Raw $file.FullName
+            if (-not $content) { continue }
+            $matches = [regex]::Matches($content, 'https?://([a-zA-Z0-9._-]+)')
+            foreach ($m in $matches) {
+              $hostName = $m.Groups[1].Value.ToLowerInvariant()
+              if ($loopbackHosts -contains $hostName) { continue }
+              if ($allowedHosts -notcontains $hostName) {
+                $hits += "$($file.FullName): $($m.Value)"
+              }
+            }
+          }
+          Write-Host "App source files scanned: $($sources.Count)"
+          if ($hits.Count -gt 0) {
+            Write-Error "URLs found that are not on the allowlist:"
+            $hits | ForEach-Object { Write-Error "  $_" }
+            exit 1
+          }
+          Write-Host "All app source URLs are on the allowlist. ✅"
+
+      - name: Vulnerability scan (x64 only)
+        if: matrix.arch == 'x64'
+        run: |
+          $output = dotnet list package --vulnerable --include-transitive 2>&1 | Out-String
+          Write-Host $output
+          if ($output -match 'has the following vulnerable packages') {
+            Write-Error "Vulnerable packages found — see output above."
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Verify published output
+        shell: pwsh
+        run: |
+          # V15.2: the earlier step looked at the wrong path
+          # (bin/Release/... not bin/${arch}/Release/...) and only at
+          # FileID.dll. Verify the real distributable: both EXE + DLL.
+          $publishDir = "src/FileID.App/bin/${{ matrix.arch }}/Release/net8.0-windows10.0.19041.0/win-${{ matrix.arch }}/publish"
+          if (-not (Test-Path $publishDir)) {
+            throw "Publish dir not found at $publishDir"
+          }
+          $exe = Get-ChildItem -Path $publishDir -Filter "FileID.exe" | Select-Object -First 1
+          $dll = Get-ChildItem -Path $publishDir -Filter "FileID.dll" | Select-Object -First 1
+          if (-not $exe) { throw "FileID.exe not found in publish output ($publishDir)" }
+          if (-not $dll) { throw "FileID.dll not found in publish output ($publishDir)" }
+          Write-Host ("FileID.exe size: {0:F1} MB" -f ($exe.Length / 1MB))
+          Write-Host ("FileID.dll size: {0:F1} MB" -f ($dll.Length / 1MB))
+          # Surface a count of every dll the publish dropped so it's
+          # visible in the run log without uploading artifacts.
+          $allDlls = Get-ChildItem -Path $publishDir -Filter "*.dll"
+          Write-Host ("publish dir contains {0} dll(s)" -f $allDlls.Count)
+
+      # Privacy gate — parity with macos.yml + windows-engine.yml. The
+      # forbidden-strings list MUST stay in sync across all three
+      # workflows + platforms/windows/build/publish-bundle.ps1. Failing
+      # this is a release blocker — no exception.
+      - name: Privacy — telemetry-string scan
+        shell: pwsh
+        run: |
+          $publishDir = "src/FileID.App/bin/${{ matrix.arch }}/Release/net8.0-windows10.0.19041.0/win-${{ matrix.arch }}/publish"
+          python ../../shared/scripts/check_binary_privacy.py $publishDir
+
+      # Launch smoke — verifies the published binary at least starts,
+      # paints chrome, and stays alive for a few seconds. Catches the
+      # class of bug we'd otherwise only learn about from the user.
+      # x64 only — ARM64 needs a hardware runner to actually execute.
+      - name: Smoke — app startup
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $publishDir = "src/FileID.App/bin/${{ matrix.arch }}/Release/net8.0-windows10.0.19041.0/win-${{ matrix.arch }}/publish"
+          $exe = Join-Path $publishDir "FileID.exe"
+          if (-not (Test-Path $exe)) { throw "FileID.exe not found at $exe" }
+          # Launch without redirecting stdin/stdout — the app expects to
+          # spawn its engine and message-pump. The headless runner has no
+          # display, so we expect the app to fail fast OR keep ticking
+          # for a couple seconds before we kill it. Either way, a NULL
+          # ref / startup crash inside OnLaunched would surface as an
+          # immediate exit with non-zero code; the smoke validates we
+          # didn't ship that.
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = (Resolve-Path $exe).Path
+          $psi.UseShellExecute = $false
+          $psi.WorkingDirectory = (Resolve-Path $publishDir).Path
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            $code = $proc.ExitCode
+            if ($code -ne 0) {
+              throw "FileID.exe exited within 5 s with code $code — likely startup crash."
+            }
+            Write-Host "FileID.exe exited cleanly within 5 s (expected on a headless runner)."
+          } else {
+            Write-Host "FileID.exe still running after 5 s — clean startup. Killing for cleanup."
+            try { $proc.Kill() } catch { }
+          }

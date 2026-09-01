@@ -1,0 +1,234 @@
+﻿// Plain DTO records used inside command + event payloads. 1:1 mirror of the
+// schema's `$defs` section. Records (immutable, init-only, value-equality)
+// match Swift's struct semantics and Rust's #[derive(Debug, Clone)] structs.
+//
+// Property naming policy is CamelCase (configured in IpcCoder); fields whose
+// wire names diverge from the C# default carry [JsonPropertyName] overrides
+// (mostly the `*ID` and `*MB` / `*GB` style names — Swift Codable doesn't
+// auto-camel-case those, so we don't either).
+
+using System.Text.Json.Serialization;
+
+namespace FileID.IpcSchema;
+
+public sealed record EngineInfo(
+    string Version,
+    int Pid,
+    uint WorkerCap,
+    [property: JsonPropertyName("physicalMemoryGB")] double PhysicalMemoryGB,
+    HardwareInfo? Hardware = null);
+
+public sealed record RestructureConfidenceCounts(ulong Auto, ulong Review, ulong Ask, ulong Unknown);
+
+public sealed record RestructurePlan(
+    string LibraryRoot,
+    System.Collections.Generic.IReadOnlyList<RestructureMove> Moves,
+    System.Collections.Generic.IReadOnlyList<RestructureCategoryCount> CategoryCounts,
+    /// <summary>Engine-authoritative Anchor/Mixed/Junk counts. Null on
+    /// plans from older engine builds that didn't compute it.</summary>
+    FolderClassificationCounts? FolderClassifications = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] ulong? TotalMoves = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] RestructureConfidenceCounts? ConfidenceCounts = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool Truncated = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] string? PlanId = null);
+
+public sealed record RestructureCategoryCount(string Category, uint Count);
+
+public sealed record FolderClassificationCounts(
+    uint AnchorFolders,
+    uint MixedFolders,
+    uint JunkFolders);
+
+public sealed record RestructureApplyResult(
+    uint Applied,
+    uint Failed,
+    string? PrivilegeError = null);
+
+public sealed record BulkActionResult(
+    string Action,
+    uint Succeeded,
+    uint Failed,
+    System.Collections.Generic.IReadOnlyList<BulkActionItem> Messages);
+
+public sealed record BulkActionItem(
+    [property: JsonPropertyName("fileID")] long? FileId,
+    bool Ok,
+    string? Message = null);
+
+public sealed record ClipTextEmbedding(
+    [property: JsonPropertyName("queryID")] string QueryId,
+    string Query,
+    System.Collections.Generic.IReadOnlyList<float> Embedding);
+
+public sealed record MergeSuggestion(
+    [property: JsonPropertyName("sourcePersonID")] long SourcePersonId,
+    [property: JsonPropertyName("destinationPersonID")] long DestinationPersonId,
+    float Similarity,
+    [property: JsonPropertyName("sourceAnchorFaceID")] long SourceAnchorFaceId,
+    [property: JsonPropertyName("destinationAnchorFaceID")] long DestinationAnchorFaceId,
+    long SourceMemberCount,
+    long DestinationMemberCount);
+
+public sealed record MergeSuggestions(
+    System.Collections.Generic.IReadOnlyList<MergeSuggestion> Pairs);
+
+/// <summary>
+/// Hardware probe surfaced by the engine on startup. Settings → Performance
+/// renders this so the user can see which acceleration path is in use and
+/// which Performance Pack would unlock more throughput.
+/// </summary>
+public sealed record HardwareInfo(
+    string GpuVendor,
+    string? AdapterName,
+    string ExecutionProvider,
+    uint PhysicalCpuCores,
+    bool CudaPackPresent,
+    bool OpenvinoPackPresent,
+    bool QnnPackPresent,
+    string Recommendation,
+    // V15.9 adaptive-utilization diagnostics. All optional with sensible
+    // defaults so an old engine talking to a new app still deserializes.
+    uint PCores = 0,
+    uint ECores = 0,
+    uint LogicalCpuCores = 0,
+    uint WorkerCap = 0,
+    [property: JsonPropertyName("ramTotalMB")] ulong RamTotalMb = 0,
+    [property: JsonPropertyName("ramAvailableMB")] ulong RamAvailableMb = 0,
+    string MemoryTier = "",
+    [property: JsonPropertyName("vramMB")] ulong VramMb = 0,
+    bool NpuPresent = false,
+    string PowerSource = "",
+    byte? BatteryPercent = null,
+    string ActiveProfile = "");
+
+/// <summary>Payload of the `hardwareReprobed` event. Engine re-runs the
+/// probe in response to `verifyCudaPack` (Settings → Performance "Verify
+/// install") and emits this with the fresh hardware snapshot + a
+/// diagnostics string explaining why the CUDA pack is absent.</summary>
+public sealed record HardwareReprobed(
+    HardwareInfo Hardware,
+    string? Diagnostics);
+
+public sealed record ScanProgress(
+    [property: JsonPropertyName("sessionID")] string SessionId,
+    ScanPhase Phase,
+    ulong Total,
+    ulong Discovered,
+    ulong Processed,
+    ulong Failed,
+    double FilesPerSecond,
+    double? EtaSeconds,
+    [property: JsonPropertyName("residentMB")] ulong ResidentMb,
+    [property: JsonPropertyName("availableMB")] ulong AvailableMb);
+
+public sealed record FileDoneEvent(
+    string Path,
+    string Kind,
+    double TotalMs,
+    bool Failed,
+    string? ErrorMessage,
+    // Schema/Rust/Swift parity: the Rust + macOS DTOs carry skippedStages; the
+    // Windows engine doesn't emit fileDone today, so this is contract hygiene
+    // (a future fileDone with skippedStages no longer silently drops the field).
+    IReadOnlyList<string>? SkippedStages = null);
+
+public sealed record BatchSummary(
+    uint BatchIndex,
+    uint FilesInBatch,
+    ulong ProcessedTotal,
+    double WallSeconds,
+    double FilesPerSecond,
+    double Utilization,
+    [property: JsonPropertyName("visionP50Ms")] double VisionP50Ms,
+    [property: JsonPropertyName("visionP95Ms")] double VisionP95Ms,
+    [property: JsonPropertyName("clipP50Ms")] double ClipP50Ms,
+    [property: JsonPropertyName("clipP95Ms")] double ClipP95Ms,
+    [property: JsonPropertyName("storeInsertP50Ms")] double StoreInsertP50Ms,
+    [property: JsonPropertyName("storeInsertP95Ms")] double StoreInsertP95Ms,
+    [property: JsonPropertyName("residentMB")] ulong ResidentMb,
+    [property: JsonPropertyName("availableMB")] ulong AvailableMb);
+
+public sealed record ScanComplete(
+    [property: JsonPropertyName("sessionID")] string SessionId,
+    ulong TotalFiles,
+    ulong ProcessedFiles,
+    ulong FailedFiles,
+    double TotalSeconds);
+
+public sealed record EngineError(
+    string Kind,
+    string Message,
+    string? Path,
+    string? ModelKind = null);
+
+public sealed record LogLine(
+    LogLevel Level,
+    string Message);
+
+public sealed record FaceClusteringResult(
+    uint PersonCount,
+    ulong FaceCount,
+    ulong UnmatchedFaces,
+    double DurationSeconds);
+
+public sealed record DeepAnalyzeStarting(
+    string ModelKind,
+    DeepAnalyzeStartingPhase Phase,
+    string Message);
+
+public sealed record DeepAnalyzeProgress(
+    ulong Processed,
+    ulong Total,
+    double? EtaSeconds,
+    string? CurrentPath,
+    string ModelKind,
+    /// <summary>Partial caption text accumulated as the VLM emits tokens.
+    /// Engine throttles to 4 Hz. Null on non-token progress events.</summary>
+    string? CurrentCaption = null);
+
+public sealed record DeepAnalyzeFileDone(
+    [property: JsonPropertyName("fileID")] long FileId,
+    string Description,
+    string? ProposedName,
+    string ModelKind);
+
+public sealed record DeepAnalyzeComplete(
+    ulong Processed,
+    ulong Failed,
+    double TotalSeconds,
+    string ModelKind,
+    bool Cancelled);
+
+public sealed record ModelDownloadProgress(
+    string ModelKind,
+    double Fraction,
+    string Message,
+    ulong? BytesDone,
+    ulong? TotalBytes);
+
+public sealed record QueueState(
+    QueuedJob? Running,
+    IReadOnlyList<QueuedJob> Pending,
+    double? TotalEtaSeconds);
+
+public sealed record QueuedJob(
+    string Id,
+    JobCategory Category,
+    string Title,
+    double? EtaSeconds);
+
+/// <summary>Reply to wipeLibrary. Ok is true when the engine truncated every
+/// table in-process; Message carries the error when it couldn't.</summary>
+public sealed record LibraryWiped(bool Ok, string? Message = null);
+
+/// <summary>Payload of the `thumbnailGenerated` event. Engine renders a video
+/// keyframe out-of-process and returns it as a base64-encoded 192px JPEG
+/// (aspect-preserved, long side = 192). <c>ModifiedAt</c> is the file's
+/// modified-unix time (f64 seconds) and is REQUIRED end-to-end because the
+/// app's thumbnail cache key is (Path, ModifiedAt) — without it the written
+/// thumbnail is never found. <c>Bytes</c> is a base64 string, NOT a byte
+/// array.</summary>
+public sealed record ThumbnailGenerated(
+    string Path,
+    double? ModifiedAt,
+    string Bytes);

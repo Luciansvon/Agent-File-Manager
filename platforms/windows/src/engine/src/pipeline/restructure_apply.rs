@@ -1,0 +1,1044 @@
+// Restructure apply — execute a `Vec<ProposedMove>` on disk.
+//
+// Two modes:
+//   * Real move (default): Windows `IFileOperation::MoveItem` — collision
+//     replacement/auto-renaming flags are absent, so an occupied destination fails
+//     instead of silently overwriting whatever is already there (B3). Atomic
+//     when same volume; copy+delete across volumes. The DB row's `path_text`
+//     is updated by a SEPARATE statement AFTER the move returns — this is NOT
+//     one transaction with the filesystem op (it can't be). A crash in the
+//     move→update window leaves the file relocated with `path_text` stale; the
+//     next scan self-heals it via rename-heal on the NTFS `file_ref`, and a
+//     failed update is also recorded to a recovery sidecar.
+//   * Symlink (advanced): `CreateSymbolicLinkW`. Requires either
+//     SeCreateSymbolicLinkPrivilege (admin) OR Developer Mode enabled.
+//     Lets the user preview the proposed structure without committing
+//     to actual moves.
+//
+// COLLISION SAFETY (B3): many distinct sources share a basename and the rule
+// cascade funnels them into one folder, so two planned moves can target the
+// same path. Each real-move destination is uniquified within its parent
+// (`name (2).ext`, …) so both files survive; nothing is ever clobbered.
+//
+// STALE-PLAN / IDENTITY GUARD (B4): a plan is built from a DB snapshot, then
+// applied after an arbitrary delay. Before each move the live DB row for
+// `file_id` is re-read and required to still name `source`, so a plan that
+// went stale (the file was renamed/moved/replaced meanwhile) can't move the
+// wrong bytes — the payload `source` string is not authoritative on its own.
+//
+// PATH-TRAVERSAL GUARD: every destination MUST canonicalize to a path
+// inside `library_root`. We refuse to write outside the user's chosen
+// library — even if the planner is buggy or someone forges a payload.
+
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use crate::ipc::{RestructureApplyResult, RestructureMove};
+use crate::pipeline::restructure_feedback;
+
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    CreateSymbolicLinkW, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+    SYMBOLIC_LINK_FLAGS,
+};
+
+pub struct RestructureApply {
+    db_conn: Arc<Mutex<Connection>>,
+    library_root: PathBuf,
+    use_symlinks: bool,
+    // F-C6-013: cooperative cancel polled between moves. Defaults to a fresh,
+    // never-set flag; the dispatcher injects a shared flag via `with_cancel` so
+    // a user "stop" aborts a 100k-move apply between moves (each completed move
+    // is already durable, so stopping mid-batch preserves per-move atomicity).
+    cancel: Arc<AtomicBool>,
+}
+
+impl RestructureApply {
+    pub fn new(db_conn: Arc<Mutex<Connection>>, library_root: PathBuf, use_symlinks: bool) -> Self {
+        Self {
+            db_conn,
+            library_root,
+            use_symlinks,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Inject a shared cancellation flag. `handle_apply_restructure` passes the
+    /// flag that the CancelScan dispatch arm sets; `apply` polls it at the top of
+    /// each move so a long apply is stoppable. (F-C6-013)
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Apply every proposed move. Stops on first hard error; returns the
+    /// applied + failed counts. A privilege error in symlink mode short-
+    /// circuits with a friendly message instead of partial writes.
+    pub fn apply(&self, moves: &[RestructureMove]) -> Result<RestructureApplyResult> {
+        self.apply_with(moves, true)
+    }
+
+    #[allow(dead_code)]
+    pub fn apply_iter<I>(&self, moves: I, _total: Option<usize>) -> Result<RestructureApplyResult>
+    where
+        I: IntoIterator<Item = Result<RestructureMove>>,
+    {
+        let vec: Vec<RestructureMove> = moves.into_iter().collect::<Result<_>>()?;
+        self.apply(&vec)
+    }
+
+    fn apply_with(
+        &self,
+        moves: &[RestructureMove],
+        record_undo: bool,
+    ) -> Result<RestructureApplyResult> {
+        let canonical_root = canonicalize_safely(&self.library_root)
+            .with_context(|| format!("library root {}", self.library_root.display()))?;
+
+        let mut applied = 0u32;
+        let mut failed = 0u32;
+        let operation_batch_id = uuid::Uuid::new_v4().to_string();
+        // Inverse of every successful real move (current → original), appended to
+        // the undo journal AS IT HAPPENS so "Undo last run" can reverse this batch —
+        // and so a crash mid-apply still leaves every COMPLETED move undoable. (The
+        // prior design buffered in memory and wrote once after the loop, losing the
+        // whole batch's undo on a crash.) Best-effort: a journal that won't open
+        // just disables undo, exactly as before. (R2 → crash-safe)
+        let mut journal = if record_undo {
+            Self::open_undo_journal_truncating()
+        } else {
+            None
+        };
+        let mut undo_count = 0usize;
+        // (source, final destination) of every successful real move, fed to the
+        // learn-from-corrections memory in ONE lock acquisition after the loop so a
+        // future plan can boost a move toward a folder the user has filed here
+        // before. Populated alongside the undo journal, so it is forward-applies-only
+        // (empty on an undo run, record_undo=false). (R3 → learn-your-style)
+        let mut applied_pairs: Vec<(String, PathBuf)> = Vec::new();
+        // B3: destinations claimed earlier in THIS batch, so two distinct
+        // sources that map to the same basename don't collide before either
+        // touches disk.
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
+
+        // F-C6-013: the apply loop was a silent, unstoppable serial walk — at
+        // 100k+ moves the user got no feedback and no stop.
+        let total = moves.len();
+        for (idx, m) in moves.iter().enumerate() {
+            // Poll the cancel flag at the TOP of every iteration. Every move
+            // already completed is durable (per-move FS op + DB update), so
+            // stopping BETWEEN moves is safe and preserves per-move atomicity.
+            if self.cancel.load(Ordering::Relaxed) {
+                tracing::info!(applied, failed, processed = idx, total, "[RESTRUCTURE] apply cancelled by user");
+                break;
+            }
+            let processed = idx + 1;
+            if should_emit_apply_progress(processed, total, APPLY_PROGRESS_INTERVAL) {
+                tracing::info!(applied, failed, processed, total, "[RESTRUCTURE] apply progress");
+            }
+
+            // B4/S6/S7: bind the move to the planned file identity. The
+            // payload `source` is not authoritative on its own — re-read the
+            // live DB row for `file_id` and require it still names this
+            // source. A stale plan (file renamed/moved/replaced since
+            // planning) is skipped so we never move the wrong bytes or stamp
+            // the row with a path that never held this file.
+            match current_path_in_db(&self.db_conn, m.file_id) {
+                Ok(Some(db_path)) if paths_equal(&db_path, &m.source) => {}
+                _ => {
+                    tracing::warn!(
+                        file_id = m.file_id,
+                        "[RESTRUCTURE] skipping stale move: source no longer matches the DB row"
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+
+            let dest = PathBuf::from(&m.destination);
+            // Path-traversal guard. The destination's parent must exist
+            // OR be createable under library_root. Canonicalize the
+            // closest existing ancestor and verify containment.
+            if let Err(err) = ensure_inside_root(&dest, &canonical_root) {
+                tracing::warn!(?err, dest=%crate::platform::redact_path_for_log(&dest), "rejecting move outside library root");
+                failed += 1;
+                continue;
+            }
+
+            if let Some(parent) = dest.parent() {
+                // SEC-5: TOCTOU defense, pass 1. Check the EXISTING ancestor
+                // chain BEFORE create_dir_all extends it — an attacker may
+                // have planted a junction in a pre-existing folder under
+                // library_root that would silently redirect the write
+                // outside the root the moment we resolve through it.
+                if has_reparse_point_in_chain(parent, &canonical_root) {
+                    tracing::warn!(
+                        parent=%crate::platform::redact_path_for_log(parent),
+                        "rejecting move: pre-existing reparse point in destination parent chain"
+                    );
+                    failed += 1;
+                    continue;
+                }
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(?err, parent=%crate::platform::redact_path_for_log(parent), "create_dir_all failed");
+                    failed += 1;
+                    continue;
+                }
+                // SEC-5: TOCTOU defense, pass 2. Re-check after
+                // create_dir_all. The window between the pre-check and
+                // here is small but non-zero; defense in depth is cheap.
+                if has_reparse_point_in_chain(parent, &canonical_root) {
+                    tracing::warn!(
+                        parent=%crate::platform::redact_path_for_log(parent),
+                        "rejecting move: reparse point appeared after create_dir_all"
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+
+            // Skip a no-op (the file already sits at its PLANNED destination)
+            // BEFORE uniquifying. If we uniquified first, `unique_destination`
+            // would see the file itself occupying `dest`, bump it to a ` (2)`
+            // sibling, and we'd rename an already-correctly-placed file —
+            // churning an organized library, silently in auto-file mode. (ENG-42)
+            if !self.use_symlinks && paths_equal(&m.source, &dest.to_string_lossy()) {
+                applied += 1;
+                continue;
+            }
+
+            // B3: real moves never clobber. `move_file` drops
+            // MOVEFILE_REPLACE_EXISTING, and we additionally resolve a
+            // collision-free name within the SAME parent (so containment +
+            // the reparse checks above still hold) — both distinct files
+            // survive. Symlink mode keeps the requested name and fails
+            // naturally if it's taken (CreateSymbolicLinkW won't overwrite).
+            let final_dest = if self.use_symlinks {
+                dest.clone()
+            } else {
+                let d = unique_destination(&dest, &claimed);
+                claimed.insert(d.clone());
+                d
+            };
+
+            let result = if self.use_symlinks {
+                make_symlink(&m.source, &final_dest)
+            } else {
+                move_file(&m.source, &final_dest)
+            };
+            match result {
+                Ok(()) => {
+                    if !self.use_symlinks {
+                        // Only update DB on real moves. Symlinks leave
+                        // `path_text` pointing at the original.
+                        if let Err(err) = update_path_in_db(
+                            &self.db_conn,
+                            m.file_id,
+                            Path::new(&m.source),
+                            &final_dest,
+                            record_undo,
+                            &operation_batch_id,
+                        ) {
+                            // B5: the file is already relocated; do NOT silently
+                            // swallow. Record it durably for recovery and log at
+                            // error. (It also self-heals on the next scan via
+                            // rename-heal on the NTFS file_ref.)
+                            tracing::error!(
+                                ?err,
+                                file_id = m.file_id,
+                                dst = %crate::platform::redact_path_for_log(&final_dest),
+                                "[RESTRUCTURE] moved on disk but DB path update failed; recorded for recovery"
+                            );
+                            record_path_update_failure(m.file_id, &m.source, &final_dest);
+                        }
+                        // Move the on-disk tags sidecar to follow the file (#27).
+                        // Real-move branch only — symlink mode leaves the source
+                        // (and its sidecar) in place. Best-effort; uses
+                        // final_dest since collisions uniquify the name.
+                        crate::shell::tags::move_sidecar(
+                            std::path::Path::new(&m.source),
+                            &final_dest,
+                        );
+                        // Record the inverse (final → original) for undo, durably.
+                        // Real moves only — symlink mode doesn't relocate the file.
+                        // Appended + periodically fsync'd so a crash on a later move
+                        // can't lose this one's undoability. (R2 → crash-safe)
+                        if let Some(j) = journal.as_mut() {
+                            Self::append_undo_entry(
+                                j,
+                                m.file_id,
+                                &final_dest.to_string_lossy(),
+                                &m.source,
+                            );
+                            undo_count += 1;
+                            if undo_count % APPLY_PROGRESS_INTERVAL == 0 {
+                                let _ = j.flush();
+                                let _ = j.get_ref().sync_all();
+                            }
+                            // Same forward-only gate as the journal: this move was
+                            // approved by the user, so credit it to the feedback memory.
+                            applied_pairs.push((m.source.clone(), final_dest.clone()));
+                        }
+                    }
+                    applied += 1;
+                }
+                Err(ApplyError::Privilege(msg)) => {
+                    return Ok(RestructureApplyResult {
+                        applied,
+                        failed,
+                        privilege_error: Some(msg),
+                    });
+                }
+                Err(ApplyError::Other(err)) => {
+                    tracing::warn!(
+                        ?err,
+                        src=%crate::platform::redact_path_for_log(&m.source),
+                        dst=%crate::platform::redact_path_for_log(&final_dest),
+                        "move failed"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+
+        // Final durability barrier — flush + fsync the remaining buffered entries
+        // so the journal is complete on a clean finish. (None during an undo run,
+        // record_undo=false, so a CANCELLED undo leaves the ORIGINAL journal intact
+        // and the user can re-run undo to finish the remainder.) (R2 → crash-safe)
+        if let Some(mut j) = journal {
+            let _ = j.flush();
+            let _ = j.get_ref().sync_all();
+        }
+
+        // Learn-from-corrections: each applied move is an approved example, so credit
+        // its filename tokens toward its destination folder for future plans. One lock
+        // acquisition for the whole batch; best-effort, never fails an apply. Forward
+        // applies only — `applied_pairs` is empty on an undo run (record_undo=false).
+        if record_undo && !applied_pairs.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            restructure_feedback::record(
+                &self.db_conn,
+                applied_pairs.iter().map(|(s, d)| (Path::new(s), d.as_path())),
+                now,
+            );
+        }
+        Ok(RestructureApplyResult { applied, failed, privilege_error: None })
+    }
+
+    // ── Undo (R2 — reversible "Undo last run") ──────────────────────────────
+
+    fn undo_journal_path() -> Option<PathBuf> {
+        crate::paths::trash_log_path()
+            .ok()
+            .and_then(|t| t.parent().map(|d| d.join("restructure_undo.ndjson")))
+    }
+
+    /// Open the undo journal truncating (fresh batch). Returns a buffered writer
+    /// each completed move's inverse is appended to, so the journal is durable
+    /// incrementally rather than written once after the loop. (R2 → crash-safe)
+    fn open_undo_journal_truncating() -> Option<BufWriter<File>> {
+        let path = Self::undo_journal_path()?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        Some(BufWriter::new(f))
+    }
+
+    /// Append one inverse-move entry (NDJSON) to the open journal — the same
+    /// on-disk format `read_undo_journal` parses: `{file_id, from, to}` per line.
+    fn append_undo_entry(j: &mut BufWriter<File>, file_id: i64, from: &str, to: &str) {
+        let line = serde_json::json!({ "file_id": file_id, "from": from, "to": to }).to_string();
+        let _ = writeln!(j, "{line}");
+    }
+
+    fn read_undo_journal() -> Vec<(i64, String, String)> {
+        let Some(path) = Self::undo_journal_path() else {
+            return Vec::new();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                Some((
+                    v.get("file_id")?.as_i64()?,
+                    v.get("from")?.as_str()?.to_string(),
+                    v.get("to")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Undo the most recent `apply`: replay the inverse moves through `apply`
+    /// itself (so the identical stale-check / containment / no-clobber / DB-update
+    /// safety applies), then clear the journal so a run can't be undone twice.
+    /// (RESTRUCTURE.md §6 reversibility)
+    pub fn undo_last(&self) -> Result<RestructureApplyResult> {
+        let entries = Self::read_undo_journal();
+        if entries.is_empty() {
+            return Ok(RestructureApplyResult { applied: 0, failed: 0, privilege_error: None });
+        }
+        let inverse: Vec<RestructureMove> = entries
+            .iter()
+            .map(|(file_id, from, to)| RestructureMove {
+                file_id: *file_id,
+                source: from.clone(),
+                destination: to.clone(),
+                category: String::new(),
+                tier: None,
+                confidence: String::new(),
+                reason: None,
+            })
+            .collect();
+        // record_undo:false so the undo's own moves DON'T overwrite the journal — a
+        // cancelled undo must leave the original intact so the user can re-run it and
+        // put the REMAINING files back (already-restored ones stale-skip on the
+        // retry). Only a fully-completed (non-cancelled) undo clears it.
+        let result = self.apply_with(&inverse, false)?;
+        if !self.cancel.load(Ordering::Relaxed) {
+            if let Some(path) = Self::undo_journal_path() {
+                let _ = std::fs::remove_file(path);
+            }
+            // Reversibility completeness: undo shouldn't leave the orphan empty group
+            // folders apply created. Best-effort, deepest-first.
+            Self::cleanup_empty_dirs(&entries, &self.library_root);
+        }
+        Ok(result)
+    }
+
+    /// Remove the empty group folders an apply created, after its undo restored the
+    /// files. `std::fs::remove_dir` only succeeds on an EMPTY dir, so user files are
+    /// never at risk; we additionally stay strictly inside the library root and never
+    /// touch the root itself. Deepest-first so nested empties fully collapse.
+    /// Best-effort. (R2 → reversibility completeness)
+    fn cleanup_empty_dirs(entries: &[(i64, String, String)], root: &Path) {
+        let mut dirs: Vec<&Path> = entries
+            .iter()
+            .filter_map(|(_, from, _)| Path::new(from).parent())
+            .collect();
+        dirs.sort_unstable();
+        dirs.dedup();
+        // Deepest path first so a nested chain collapses bottom-up.
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for dir in dirs {
+            let mut cur = dir.to_path_buf();
+            while cur.as_path() != root && cur.starts_with(root) && std::fs::remove_dir(&cur).is_ok()
+            {
+                match cur.parent() {
+                    Some(p) => cur = p.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+const APPLY_PROGRESS_INTERVAL: usize = 500;
+
+/// Apply-progress throttle: emit on the first move, on the last, and once per
+/// `interval` processed moves, so a 100k-move apply logs ~total/interval lines
+/// instead of none (silent) or one-per-move (flood). Pure → the cadence is
+/// unit-assertable. (F-C6-013)
+fn should_emit_apply_progress(processed: usize, total: usize, interval: usize) -> bool {
+    if interval == 0 || processed == 0 {
+        return false;
+    }
+    processed == 1 || processed == total || processed % interval == 0
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ApplyError {
+    Privilege(String),
+    Other(anyhow::Error),
+}
+
+#[cfg(windows)]
+fn move_file(src: &str, dst: &Path) -> std::result::Result<(), ApplyError> {
+    crate::shell::file_ops::move_path(Path::new(src), dst).map_err(ApplyError::Other)
+}
+
+#[cfg(windows)]
+fn make_symlink(src: &str, dst: &Path) -> std::result::Result<(), ApplyError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    // \\?\ prefix both operands so the link can be created (and its target
+    // resolved) past MAX_PATH (260) — same rationale as move_file.
+    let src_ext = crate::util::path_safety::to_extended_length(Path::new(src));
+    let dst_ext = crate::util::path_safety::to_extended_length(dst);
+    let src_w: Vec<u16> = src_ext
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let dst_w: Vec<u16> = dst_ext
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    let r = unsafe {
+        CreateSymbolicLinkW(
+            PCWSTR(dst_w.as_ptr()),
+            PCWSTR(src_w.as_ptr()),
+            SYMBOLIC_LINK_FLAGS(flags.0),
+        )
+    };
+    if r.as_bool() {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(1314) {
+            // ERROR_PRIVILEGE_NOT_HELD
+            Err(ApplyError::Privilege(
+                "Symlink mode needs Developer Mode enabled \
+                 (Settings → Privacy & security → For developers) \
+                 OR an elevated FileID. Try the default 'real move' mode instead."
+                    .into(),
+            ))
+        } else {
+            Err(ApplyError::Other(anyhow::Error::msg(err.to_string())))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn move_file(src: &str, dst: &Path) -> std::result::Result<(), ApplyError> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    match std::fs::copy(src, dst) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(src);
+            Ok(())
+        }
+        Err(e) => Err(ApplyError::Other(anyhow::Error::from(e))),
+    }
+}
+
+#[cfg(not(windows))]
+fn make_symlink(src: &str, dst: &Path) -> std::result::Result<(), ApplyError> {
+    std::os::unix::fs::symlink(src, dst)
+        .map_err(|e| ApplyError::Other(anyhow::Error::from(e)))
+}
+
+fn update_path_in_db(
+    conn: &Arc<Mutex<Connection>>,
+    file_id: i64,
+    source_path: &Path,
+    new_path: &Path,
+    record_forward_operation: bool,
+    batch_id: &str,
+) -> Result<()> {
+    let conn = conn.lock();
+    // ENG-91: keep path_hash in sync with path_text (same as the rename command
+    // + every dbwriter insert) so the column stays consistent for lookups/dedup
+    // and cross-platform DB parity — a move that updated only path_text left a
+    // stale hash.
+    let path_text = new_path.to_string_lossy();
+    let path_hash = crate::util::path_safety::stable_path_hash(&path_text);
+    // prepare_cached: a plan can issue thousands of moves, so cache the parse on
+    // the long-lived writer connection (codebase idiom — see bulk.rs/dbwriter.rs).
+    // NFC-normalize path_search like the dbwriter insert + macOS do, so an
+    // NFD-accented name stays findable by the app's NFC-normalized search query
+    // (the v16 contract). Without this, a moved file is unsearchable by its
+    // accented name until the next rescan re-stamps it. (audit parity fix)
+    let path_search = crate::pipeline::dbwriter::nfc_path_search(&path_text);
+    let source_text = source_path.to_string_lossy();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    let tx = conn
+        .unchecked_transaction()
+        .context("opening organize journal transaction")?;
+    tx.prepare_cached(
+        "UPDATE files SET path_text = ?1, path_hash = ?2, path_search = ?4 WHERE id = ?3",
+    )?
+    .execute(params![path_text, path_hash, file_id, path_search])
+    .context("DB UPDATE files.path_text")?;
+    if record_forward_operation {
+        tx.execute(
+            "INSERT INTO file_operation_journal \
+             (operation_id, batch_id, file_id, internal_asset_id, operation_kind, \
+              source_path, destination_path, state, created_at) \
+             SELECT ?1, ?2, id, internal_asset_id, 'organize', ?3, ?4, 'applied', ?5 \
+             FROM files WHERE id = ?6",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                batch_id,
+                source_text,
+                path_text,
+                now,
+                file_id,
+            ],
+        )
+        .context("recording organize operation")?;
+    } else {
+        tx.execute(
+            "UPDATE file_operation_journal SET state = 'undone', undone_at = ?1 \
+             WHERE operation_id = ( \
+               SELECT operation_id FROM file_operation_journal \
+               WHERE file_id = ?2 AND operation_kind = 'organize' AND state = 'applied' \
+                 AND source_path = ?3 AND destination_path = ?4 \
+               ORDER BY created_at DESC LIMIT 1 \
+             )",
+            params![now, file_id, path_text, source_text],
+        )
+        .context("marking organize operation undone")?;
+    }
+    tx.commit().context("committing organize journal transaction")?;
+    Ok(())
+}
+
+/// B4: the current `path_text` the DB holds for `file_id`, or None if the row
+/// is gone. The single authoritative source for what `file_id` actually names.
+fn current_path_in_db(conn: &Arc<Mutex<Connection>>, file_id: i64) -> Result<Option<String>> {
+    let conn = conn.lock();
+    let mut stmt = conn.prepare_cached("SELECT path_text FROM files WHERE id = ?1")?;
+    stmt.query_row(params![file_id], |row| row.get::<_, String>(0))
+        .optional()
+        .context("DB SELECT files.path_text")
+}
+
+/// Path equality that tolerates separator/case differences. Fast path is a
+/// string compare (the normal case — both came from the same DB row at plan
+/// time); otherwise compare canonical forms (a non-existent path canonicalizes
+/// to Err and is treated as not-equal, so a vanished source is a mismatch).
+fn paths_equal(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// B3: resolve a destination that collides with neither an on-disk file nor a
+/// destination already claimed by an earlier move in this batch, by appending
+/// ` (2)`, ` (3)`, … before the extension — within the same parent so the
+/// containment/reparse checks already performed on `dest` still hold.
+fn unique_destination(dest: &Path, claimed: &HashSet<PathBuf>) -> PathBuf {
+    let occupied = |p: &Path| {
+        // \\?\ prefix so a deep already-occupied destination is detected rather
+        // than mis-probed as free (std::fs silently fails past MAX_PATH).
+        claimed.contains(p)
+            || std::fs::symlink_metadata(crate::util::path_safety::to_extended_length(p)).is_ok()
+    };
+    if !occupied(dest) {
+        return dest.to_path_buf();
+    }
+    let parent = dest.parent().unwrap_or_else(|| Path::new(""));
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = dest.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 2..=9999u32 {
+        let name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(name);
+        if !occupied(&candidate) {
+            return candidate;
+        }
+    }
+    // Exhausted — return the original; the no-REPLACE move then fails safely.
+    dest.to_path_buf()
+}
+
+/// B5: best-effort durable record of a successful on-disk move whose DB
+/// path-update failed, so the stale `path_text` is recoverable even if the
+/// next scan (which self-heals via rename-heal on the NTFS `file_ref`) never
+/// runs. NDJSON, append-only; a recovery hint, not a restore authority like
+/// `trash_log`, so no HMAC. Written beside the trash log.
+fn record_path_update_failure(file_id: i64, src: &str, dst: &Path) {
+    let Ok(trash) = crate::paths::trash_log_path() else {
+        return;
+    };
+    let Some(dir) = trash.parent() else {
+        return;
+    };
+    let path = dir.join("restructure_recover.ndjson");
+    let line = serde_json::json!({
+        "file_id": file_id,
+        "src": src,
+        "dst": dst.to_string_lossy(),
+    })
+    .to_string();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+        let _ = f.sync_all();
+    }
+}
+
+/// Canonicalize a path, treating a missing target as "exists in spirit".
+/// Walks up to the closest existing ancestor and canonicalizes that —
+/// the unresolved tail is appended back. Lets us containment-check
+/// destinations that don't exist yet (we're about to create them).
+fn canonicalize_safely(p: &Path) -> Result<PathBuf> {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return Ok(c);
+    }
+    let mut cur = p.to_path_buf();
+    let mut tail = PathBuf::new();
+    while !cur.exists() {
+        if let Some(name) = cur.file_name() {
+            tail = if tail.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                Path::new(name).join(tail)
+            };
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    let mut canonical = std::fs::canonicalize(&cur)
+        .with_context(|| format!("canonicalize ancestor {}", cur.display()))?;
+    canonical.push(tail);
+    Ok(canonical)
+}
+
+fn ensure_inside_root(dest: &Path, canonical_root: &Path) -> Result<()> {
+    let canonical_dest = canonicalize_safely(dest)?;
+    if !canonical_dest.starts_with(canonical_root) {
+        anyhow::bail!(
+            "destination {} is outside library root {}",
+            canonical_dest.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// SEC-5: walk every ancestor of `path` up to (but not including) `root`
+/// and return true if any of them is a reparse point (junction or
+/// symlink). Used as a TOCTOU defense before MoveFileExW: even if the
+/// CANONICAL path checks out, an attacker who plants a junction in the
+/// destination's parent BETWEEN the canonicalize call and the MoveFileExW
+/// call would redirect the write outside library_root. Refusing moves
+/// that pass through reparse points eliminates that surface.
+#[cfg(windows)]
+fn has_reparse_point_in_chain(parent: &Path, root: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use crate::util::path_safety::strip_extended_length;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    // `parent` is the raw (non-verbatim) destination parent from the IPC plan,
+    // but `root` arrives canonicalized — on Windows that is a verbatim `\\?\C:\…`
+    // path. Comparing the two prefix forms made `cur.starts_with(root)` false on
+    // the FIRST iteration, so the walk broke after checking only the leaf parent
+    // and never inspected intermediate ancestors — silently reducing the SEC-5
+    // junction-TOCTOU defense to one level. Normalize BOTH operands with
+    // strip_extended_length, which removes the `\\?\` prefix WITHOUT resolving the
+    // link (std::fs::canonicalize must NOT be used here: it follows the junction
+    // and defeats detection), so the ancestor walk runs up to the real root.
+    let root_norm = strip_extended_length(root);
+    let mut cur = parent.to_path_buf();
+    loop {
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return true;
+            }
+        }
+        // Stop once we reach (or pass) the root. Compared CASE-INSENSITIVELY and
+        // component-wise: NTFS is case-insensitive, so a raw IPC parent that
+        // differs only in casing from the canonical root (e.g. `d:\library\…` vs
+        // canonical `D:\Library`) must still be recognized as inside it. Plain
+        // `Path::starts_with` is case-sensitive and broke this walk after a single
+        // level on any casing mismatch — silently reducing SEC-5 to one ancestor.
+        // (audit F-A2)
+        let cur_norm = strip_extended_length(&cur);
+        let under = ci_starts_with(&cur_norm, &root_norm);
+        let at_root = under && ci_starts_with(&root_norm, &cur_norm);
+        if at_root || !under {
+            break;
+        }
+        if !cur.pop() { break; }
+    }
+    false
+}
+
+/// Component-wise, case-insensitive prefix test (Windows NTFS is
+/// case-insensitive). Unlike a lowercased-string `starts_with`, this respects
+/// path-component boundaries so a sibling like `…\PhotosBackup` cannot
+/// prefix-match `…\Photos`. (audit F-A2)
+///
+/// Folds with full Unicode `to_lowercase`, not `eq_ignore_ascii_case`: an
+/// ASCII-only fold left a non-ASCII component (e.g. `Café` vs `CAFÉ`) compared
+/// byte-exact, so a library root with a case-differing accented component made
+/// `under` false on the first iteration and the SEC-5 reparse walk broke after
+/// inspecting only the leaf parent — leaving every intermediate ancestor
+/// unchecked. Unicode folding keeps the component-wise structure (siblings
+/// still can't prefix-match) and only ever makes the walk continue further,
+/// the conservative/safe direction. (audit R3-18)
+#[cfg(windows)]
+fn ci_starts_with(p: &Path, prefix: &Path) -> bool {
+    let mut pc = p.components();
+    for pre in prefix.components() {
+        match pc.next() {
+            Some(c)
+                if c.as_os_str().to_string_lossy().to_lowercase()
+                    == pre.as_os_str().to_string_lossy().to_lowercase() =>
+            {
+                continue
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn has_reparse_point_in_chain(_parent: &Path, _root: &Path) -> bool { false }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_emit_apply_progress_cadence() {
+        // Never on the zeroth processed item or with a zero interval.
+        assert!(!should_emit_apply_progress(0, 1000, 500));
+        assert!(!should_emit_apply_progress(500, 1000, 0));
+        // First move (immediate feedback), every `interval`, and the last move.
+        assert!(should_emit_apply_progress(1, 1000, 500));
+        assert!(should_emit_apply_progress(500, 1000, 500));
+        assert!(should_emit_apply_progress(1000, 1000, 500));
+        // Silent on the in-between indices (so 100k moves → ~200 lines, not 100k).
+        assert!(!should_emit_apply_progress(2, 1000, 500));
+        assert!(!should_emit_apply_progress(499, 1000, 500));
+        assert!(!should_emit_apply_progress(501, 1000, 500));
+    }
+
+    /// F-C6-013: a pre-cancelled apply must break before touching the filesystem
+    /// — no move, and a cancel is NOT counted as a failure. Cross-platform: the
+    /// cancel poll sits at the top of the loop, ahead of the (Windows-only)
+    /// move_file, so the loop exits without reaching it.
+    #[test]
+    fn apply_honors_cancel_before_moving_any_file() {
+        let root = std::env::temp_dir().join(format!("fileid-apply-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("a.jpg");
+        std::fs::write(&src, b"data").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        insert_file_row(&conn, 1, &src.to_string_lossy());
+        let db = Arc::new(Mutex::new(conn));
+
+        // Already cancelled before apply runs.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let apply = RestructureApply::new(db, root.clone(), false).with_cancel(cancel);
+        let dest = root.join("Sorted").join("a.jpg").to_string_lossy().into_owned();
+        let res = apply
+            .apply(&[move_fixture(1, &src.to_string_lossy(), &dest)])
+            .unwrap();
+
+        assert_eq!(res.applied, 0, "cancelled before any move applies");
+        assert_eq!(res.failed, 0, "a cancel is not a failure");
+        assert!(src.exists(), "source untouched by a cancelled apply");
+        assert!(!root.join("Sorted").join("a.jpg").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_inside_root_accepts_canonical_descendant() {
+        let tmp = std::env::temp_dir();
+        let root = tmp.join("fileid-test-root");
+        let _ = std::fs::create_dir_all(&root);
+        let inside = root.join("Photos").join("2024").join("a.jpg");
+        let canonical_root = canonicalize_safely(&root).unwrap();
+        assert!(ensure_inside_root(&inside, &canonical_root).is_ok());
+    }
+
+    #[test]
+    fn unique_destination_disambiguates_collisions() {
+        let tmp = std::env::temp_dir().join("fileid-uniq-dest-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let dest = tmp.join("audio.mp3");
+        // Nothing assigned, file absent → original name.
+        let assigned0: HashSet<PathBuf> = HashSet::new();
+        assert_eq!(unique_destination(&dest, &assigned0), dest);
+        // A second move targeting the same name in-batch → " (2)".
+        let mut assigned1: HashSet<PathBuf> = HashSet::new();
+        assigned1.insert(dest.clone());
+        let d2 = unique_destination(&dest, &assigned1);
+        assert_eq!(d2, tmp.join("audio (2).mp3"));
+        assert_ne!(d2, dest);
+        // A file already on disk also forces disambiguation.
+        std::fs::write(&dest, b"x").unwrap();
+        let d3 = unique_destination(&dest, &assigned0);
+        assert_eq!(d3, tmp.join("audio (2).mp3"));
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn ensure_inside_root_rejects_traversal() {
+        let tmp = std::env::temp_dir();
+        let root = tmp.join("fileid-test-root2");
+        let _ = std::fs::create_dir_all(&root);
+        let canonical_root = canonicalize_safely(&root).unwrap();
+        let outside = canonical_root.parent().unwrap().join("evil.jpg");
+        assert!(ensure_inside_root(&outside, &canonical_root).is_err());
+    }
+
+    #[test]
+    fn unique_destination_avoids_disk_and_claimed_collisions() {
+        let dir = std::env::temp_dir().join(format!("fileid-uniqdest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("IMG.jpg");
+
+        // Free → returned as-is.
+        let empty = HashSet::new();
+        assert_eq!(unique_destination(&dest, &empty), dest);
+
+        // On disk → bumped to " (2)".
+        std::fs::write(&dest, b"x").unwrap();
+        assert_eq!(unique_destination(&dest, &empty), dir.join("IMG (2).jpg"));
+
+        // " (2)" also claimed this batch → bumped to " (3)".
+        let mut claimed = HashSet::new();
+        claimed.insert(dir.join("IMG (2).jpg"));
+        assert_eq!(unique_destination(&dest, &claimed), dir.join("IMG (3).jpg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn move_fixture(file_id: i64, source: &str, destination: &str) -> RestructureMove {
+        RestructureMove {
+            file_id,
+            source: source.to_string(),
+            destination: destination.to_string(),
+            category: "Sorted".to_string(),
+            tier: None,
+            confidence: String::new(),
+            reason: None,
+        }
+    }
+
+    fn insert_file_row(conn: &Connection, id: i64, path: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path_text, path_hash, size_bytes, scanned_at, kind, extension, failed) \
+             VALUES (?1, ?2, 0, 4, 0.0, 'image', 'jpg', 0)",
+            params![id, path],
+        )
+        .unwrap();
+    }
+
+    /// B3: two distinct sources sharing a basename, funnelled to the same
+    /// destination, must BOTH survive — the second is uniquified, never
+    /// clobbered. Windows-only: exercises the real MoveFileExW path; the
+    /// non-Windows move_file stub intentionally bails (Linux port deferred).
+    #[test]
+    #[cfg(windows)]
+    fn apply_two_same_basename_sources_keeps_both() {
+        let root = std::env::temp_dir().join(format!("fileid-apply-both-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a_dir = root.join("a");
+        let b_dir = root.join("b");
+        let dest_dir = root.join("Sorted");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::create_dir_all(&b_dir).unwrap();
+        let src_a = a_dir.join("IMG_0001.jpg");
+        let src_b = b_dir.join("IMG_0001.jpg");
+        std::fs::write(&src_a, b"AAAA").unwrap();
+        std::fs::write(&src_b, b"BBBB").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        insert_file_row(&conn, 1, &src_a.to_string_lossy());
+        insert_file_row(&conn, 2, &src_b.to_string_lossy());
+        let db = Arc::new(Mutex::new(conn));
+
+        let apply = RestructureApply::new(db, root.clone(), false);
+        let dest = dest_dir.join("IMG_0001.jpg").to_string_lossy().into_owned();
+        let moves = vec![
+            move_fixture(1, &src_a.to_string_lossy(), &dest),
+            move_fixture(2, &src_b.to_string_lossy(), &dest),
+        ];
+        let res = apply.apply(&moves).unwrap();
+
+        assert_eq!(res.applied, 2, "both moves applied");
+        assert_eq!(res.failed, 0);
+        let first = dest_dir.join("IMG_0001.jpg");
+        let second = dest_dir.join("IMG_0001 (2).jpg");
+        assert!(first.exists() && second.exists(), "both files survived under distinct names");
+        // No clobber: the two original payloads are both present.
+        let mut bodies = std::collections::HashSet::new();
+        bodies.insert(std::fs::read(&first).unwrap());
+        bodies.insert(std::fs::read(&second).unwrap());
+        assert!(bodies.contains(b"AAAA".as_slice()) && bodies.contains(b"BBBB".as_slice()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R3-18: ci_starts_with must fold NON-ASCII case (NTFS is case-insensitive
+    /// for accented letters too), or the SEC-5 reparse-point walk breaks early
+    /// on a library root with a case-differing accented component. The
+    /// component-wise structure must still reject a sibling prefix.
+    #[test]
+    #[cfg(windows)]
+    fn ci_starts_with_folds_non_ascii_and_respects_boundaries() {
+        use std::path::Path;
+        assert!(
+            ci_starts_with(Path::new(r"D:\Photos\CAFÉ\2024"), Path::new(r"D:\Photos\café")),
+            "non-ASCII case must fold (NTFS is case-insensitive for accented letters)"
+        );
+        assert!(
+            !ci_starts_with(Path::new(r"D:\PhotosBackup"), Path::new(r"D:\Photos")),
+            "a sibling must not prefix-match (component boundaries respected)"
+        );
+    }
+
+    /// B4: a move whose source no longer matches the live DB row for its
+    /// file_id is a stale plan and must be skipped, not executed.
+    #[test]
+    fn apply_skips_stale_move_when_source_mismatches_db() {
+        let root = std::env::temp_dir().join(format!("fileid-apply-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real.jpg");
+        std::fs::write(&real, b"data").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        // The DB says file 1 lives at `real`, but the (stale) plan claims a
+        // different source path.
+        insert_file_row(&conn, 1, &real.to_string_lossy());
+        let db = Arc::new(Mutex::new(conn));
+
+        let apply = RestructureApply::new(db, root.clone(), false);
+        let stale_src = root.join("vanished.jpg").to_string_lossy().into_owned();
+        let dest = root.join("Sorted").join("x.jpg").to_string_lossy().into_owned();
+        let res = apply.apply(&[move_fixture(1, &stale_src, &dest)]).unwrap();
+
+        assert_eq!(res.applied, 0, "stale move must not apply");
+        assert_eq!(res.failed, 1);
+        assert!(real.exists(), "the real file must be untouched");
+        assert!(!root.join("Sorted").join("x.jpg").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

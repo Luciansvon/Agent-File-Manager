@@ -1,0 +1,222 @@
+﻿// WinVerifyTrustChecker — Authenticode integrity check on the engine binary.
+//
+//'s SecCode/SecStaticCode validation. On
+// every spawn, the app verifies that FileIDEngine.exe's Authenticode chain
+// is intact AND chains to a publisher we trust. Refuses to spawn on
+// mismatch — same threat model as macOS (a malicious replacement engine
+// next to FileID.exe should not be loadable).
+//
+// The check runs and surfaces the verdict via the IntegrityVerdict enum.
+// For dev builds (unsigned binaries) the verdict is `Unsigned`; the
+// EngineClient logs a warning and proceeds. Signed releases must verify
+// against an EV cert thumbprint pinned here (set at ship time).
+//
+// References:
+//   docs.microsoft.com/en-us/windows/win32/api/wintrust/nf-wintrust-winverifytrust
+
+using System.Runtime.InteropServices;
+
+namespace FileID.Services;
+
+internal enum IntegrityVerdict
+{
+    /// <summary>Signature present, chain valid, publisher trusted (or skipped per policy).</summary>
+    Trusted,
+
+    /// <summary>Binary is unsigned. Acceptable in dev builds; rejected on shipped EV-signed releases.</summary>
+    Unsigned,
+
+    /// <summary>Signature is present but failed verification (revoked cert, tamper, etc).</summary>
+    Untrusted,
+
+    /// <summary>The file does not exist or cannot be opened.</summary>
+    NotFound,
+}
+
+internal static class WinVerifyTrustChecker
+{
+    /// <summary>
+    /// Verify the Authenticode signature on a file. The optional
+    /// <paramref name="expectedThumbprintHex"/> pins the publisher cert SHA-1
+    /// thumbprint; pass null to accept any trusted publisher. Until an EV
+    /// cert is provisioned, call sites pass null and act on the
+    /// `Trusted` / `Unsigned` distinction.
+    /// </summary>
+    public static IntegrityVerdict Verify(string path, string? expectedThumbprintHex = null)
+    {
+        // File.Exists wrapped — paths with invalid chars or
+        // denied access on the parent dir would throw.
+        bool exists;
+        try { exists = System.IO.File.Exists(path); }
+        catch (System.IO.IOException) { exists = false; }
+        catch (System.UnauthorizedAccessException) { exists = false; }
+        if (!exists)
+        {
+            return IntegrityVerdict.NotFound;
+        }
+
+        // SEC-4: WTD_REVOCATION_CHECK_CHAIN in dwProvFlags is a no-op
+        // unless fdwRevocationChecks asks for it. The previous version
+        // had REVOKE_NONE so revocation never actually ran. Set
+        // WHOLECHAIN to validate every cert in the chain (including the
+        // root CA) against published CRL/OCSP. This is what blocks a
+        // signed-but-revoked binary from spawning.
+        var fileInfo = new WinTrustFileInfo
+        {
+            cbStruct = (uint)Marshal.SizeOf<WinTrustFileInfo>(),
+            pszFilePath = path,
+            hFile = IntPtr.Zero,
+            pgKnownSubject = IntPtr.Zero,
+        };
+
+        IntPtr fileInfoPtr = Marshal.AllocHGlobal((int)fileInfo.cbStruct);
+        IntPtr trustDataPtr = IntPtr.Zero;
+        try
+        {
+            Marshal.StructureToPtr(fileInfo, fileInfoPtr, fDeleteOld: false);
+
+            var trustData = new WinTrustData
+            {
+                cbStruct = (uint)Marshal.SizeOf<WinTrustData>(),
+                pPolicyCallbackData = IntPtr.Zero,
+                pSIPClientData = IntPtr.Zero,
+                dwUIChoice = WTD_UI_NONE,
+                fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN,
+                dwUnionChoice = WTD_CHOICE_FILE,
+                pInfoStruct = fileInfoPtr,
+                dwStateAction = WTD_STATEACTION_VERIFY,
+                hWVTStateData = IntPtr.Zero,
+                pwszURLReference = null,
+                // WTD_CACHE_ONLY_URL_RETRIEVAL: revocation uses ONLY locally
+                // cached CRL/OCSP and never makes a network request. This keeps
+                // the integrity/revocation check while honoring the product's
+                // no-extra-egress, offline-first stance — the live WHOLECHAIN
+                // fetch otherwise hit a third-party CA on every engine spawn
+                // and froze/blocked launch when offline or the CA was slow.
+                dwProvFlags = WTD_REVOCATION_CHECK_CHAIN | WTD_CACHE_ONLY_URL_RETRIEVAL,
+                dwUIContext = 0,
+                pSignatureSettings = IntPtr.Zero,
+            };
+            trustDataPtr = Marshal.AllocHGlobal((int)trustData.cbStruct);
+            Marshal.StructureToPtr(trustData, trustDataPtr, fDeleteOld: false);
+
+            int hr = NativeWinVerifyTrust(IntPtr.Zero, ref WINTRUST_ACTION_GENERIC_VERIFY_V2, trustDataPtr);
+
+            // Always issue a Close to release the WVT state, regardless of hr.
+            // Read the NATIVE struct back first: the VERIFY call allocated per-call
+            // state and wrote its handle into hWVTStateData in native memory.
+            // Re-marshaling the stale managed copy (whose hWVTStateData is still
+            // Zero) would clobber that handle, so CLOSE would receive NULL and
+            // wintrust would free nothing — leaking the state (native heap +
+            // cert-chain context) on every engine spawn. Round-tripping the native
+            // struct preserves the handle so CLOSE actually releases it.
+            var afterVerify = Marshal.PtrToStructure<WinTrustData>(trustDataPtr);
+            afterVerify.dwStateAction = WTD_STATEACTION_CLOSE;
+            Marshal.StructureToPtr(afterVerify, trustDataPtr, fDeleteOld: true);
+            _ = NativeWinVerifyTrust(IntPtr.Zero, ref WINTRUST_ACTION_GENERIC_VERIFY_V2, trustDataPtr);
+
+            return InterpretResult(hr, expectedThumbprintHex, path);
+        }
+        finally
+        {
+            if (trustDataPtr != IntPtr.Zero) Marshal.FreeHGlobal(trustDataPtr);
+            if (fileInfoPtr != IntPtr.Zero)
+            {
+                Marshal.DestroyStructure<WinTrustFileInfo>(fileInfoPtr);
+                Marshal.FreeHGlobal(fileInfoPtr);
+            }
+        }
+    }
+
+    private static IntegrityVerdict InterpretResult(int hr, string? expectedThumbprintHex, string path)
+    {
+        // S_OK (0) = Trusted. TRUST_E_NOSIGNATURE = Unsigned.
+        // Anything else = Untrusted (revoked, tampered, expired, etc).
+        const int TRUST_E_NOSIGNATURE = unchecked((int)0x800B0100);
+        const int TRUST_E_BAD_DIGEST = unchecked((int)0x80096010);
+
+        if (hr == 0)
+        {
+            // Optional cert-pinning. If a thumbprint is supplied, walk the
+            // certificate chain and confirm the leaf matches.
+            if (!string.IsNullOrWhiteSpace(expectedThumbprintHex))
+            {
+                if (!CertificateThumbprintMatches(path, expectedThumbprintHex))
+                {
+                    DebugLog.Warn($"WinVerifyTrust: signed but thumbprint mismatch for {PathRedactor.Redact(path)}");
+                    return IntegrityVerdict.Untrusted;
+                }
+            }
+            return IntegrityVerdict.Trusted;
+        }
+        if (hr == TRUST_E_NOSIGNATURE)
+        {
+            return IntegrityVerdict.Unsigned;
+        }
+        DebugLog.Warn($"WinVerifyTrust: hr=0x{hr:X8} for {PathRedactor.Redact(path)}");
+        if (hr == TRUST_E_BAD_DIGEST)
+        {
+            return IntegrityVerdict.Untrusted;
+        }
+        return IntegrityVerdict.Untrusted;
+    }
+
+    private static bool CertificateThumbprintMatches(string path, string expectedHex)
+    {
+        try
+        {
+            var cert = System.Security.Cryptography.X509Certificates.X509Certificate.CreateFromSignedFile(path);
+            using var cert2 = new System.Security.Cryptography.X509Certificates.X509Certificate2(cert);
+            var actualHex = cert2.Thumbprint;
+            return string.Equals(actualHex, expectedHex.Replace(" ", "").Replace(":", ""), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Warn("Cert thumbprint check failed: " + ex.Message);
+            return false;
+        }
+    }
+
+    // ─── Win32 interop ─────────────────────────────────────────────────────
+
+    private const uint WTD_UI_NONE = 2;
+    private const uint WTD_REVOKE_NONE = 0;
+    private const uint WTD_REVOKE_WHOLECHAIN = 1; // SEC-4: actually checks revocation
+    private const uint WTD_CHOICE_FILE = 1;
+    private const uint WTD_STATEACTION_VERIFY = 1;
+    private const uint WTD_STATEACTION_CLOSE = 2;
+    private const uint WTD_REVOCATION_CHECK_CHAIN = 0x00000040;
+    private const uint WTD_CACHE_ONLY_URL_RETRIEVAL = 0x00001000; // revocation: cached data only, no network
+
+    private static Guid WINTRUST_ACTION_GENERIC_VERIFY_V2 = new("00AAC56B-CD44-11D0-8CC2-00C04FC295EE");
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WinTrustFileInfo
+    {
+        public uint cbStruct;
+        [MarshalAs(UnmanagedType.LPWStr)] public string pszFilePath;
+        public IntPtr hFile;
+        public IntPtr pgKnownSubject;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WinTrustData
+    {
+        public uint cbStruct;
+        public IntPtr pPolicyCallbackData;
+        public IntPtr pSIPClientData;
+        public uint dwUIChoice;
+        public uint fdwRevocationChecks;
+        public uint dwUnionChoice;
+        public IntPtr pInfoStruct;
+        public uint dwStateAction;
+        public IntPtr hWVTStateData;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? pwszURLReference;
+        public uint dwProvFlags;
+        public uint dwUIContext;
+        public IntPtr pSignatureSettings;
+    }
+
+    [DllImport("wintrust.dll", EntryPoint = "WinVerifyTrust", CharSet = CharSet.Unicode, SetLastError = false)]
+    private static extern int NativeWinVerifyTrust(IntPtr hWnd, ref Guid pgActionID, IntPtr pWVTData);
+}

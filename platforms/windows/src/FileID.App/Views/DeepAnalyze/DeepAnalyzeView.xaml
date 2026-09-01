@@ -1,0 +1,478 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+    DeepAnalyzeView — VLM picker + analyze controls + live caption
+    stream.
+
+    Layout:
+      Row 0: Page header (title + subtitle)
+      Row 1: llama.cpp runtime banner (visible if missing)
+      Row 2: Model picker — three cards in a UniformGrid
+      Row 3: Active card panel — Analyze whole library / selected / current,
+             Cancel, Skip-existing toggle
+      Row 4: Live caption stream — current file thumb + token RichText +
+             progress bar + N-of-M counter
+      Row 5: Proposed renames footer — link to BulkRenameSheet pre-seeded
+-->
+<UserControl
+    x:Class="FileID.Views.DeepAnalyze.DeepAnalyzeView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <!-- HorizontalAlignment=Center (was Stretch) for the
+             same reason as Settings — center the MaxWidth-capped column
+             on wide windows. -->
+        <StackPanel Padding="32,32,32,32" Spacing="20" MaxWidth="980" HorizontalAlignment="Center">
+
+            <StackPanel Spacing="4">
+                <TextBlock Text="AI Rename" Style="{StaticResource TitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level1" />
+                <TextBlock TextWrapping="Wrap"
+                           Style="{StaticResource BodyTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Text="AI lokal membaca konteks foto dan dokumen, lalu membuat usulan nama. Tidak ada file yang berubah sebelum kamu menyetujui preview." />
+            </StackPanel>
+
+            <!-- Item 4: plain-language explainer distinguishing automatic
+                 in-scan Tagging from the opt-in Deep Analyze pass. Dismissible;
+                 the close button persists HideDeepAnalyzeExplainer. Mirror of
+                 the macOS DeepAnalyzeView explainerCard. -->
+            <Border x:Name="ExplainerBanner"
+                    CornerRadius="10"
+                    Padding="14,12"
+                    Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                    BorderBrush="{ThemeResource AiBrush}"
+                    BorderThickness="1"
+                    Visibility="Collapsed">
+                <Grid ColumnSpacing="12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="&#xE946;"
+                              FontSize="16"
+                              Foreground="{ThemeResource AiBrush}"
+                              VerticalAlignment="Top"
+                              Margin="0,2,0,0"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <StackPanel Grid.Column="1" Spacing="4">
+                        <TextBlock Text="Index cepat vs. AI Rename"
+                                   Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock TextWrapping="Wrap"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Text="Index cepat berjalan otomatis untuk pencarian. AI Rename adalah tahap lebih berat yang membaca konteks file dan menyarankan nama spesifik. Nama berkonfidensi rendah tetap tidak terpilih." />
+                    </StackPanel>
+                    <Button Grid.Column="2"
+                            x:Name="DismissExplainerButton"
+                            Click="OnDismissExplainerClicked"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Padding="6"
+                            VerticalAlignment="Top"
+                            AutomationProperties.Name="Hide this explanation"
+                            ToolTipService.ToolTip="Hide this explanation">
+                        <FontIcon Glyph="&#xE711;" FontSize="12" />
+                    </Button>
+                </Grid>
+            </Border>
+
+            <!-- Runtime and accelerator downloads are explicit user actions.
+                 Background startup never installs models or runtimes. -->
+
+            <!-- "Name people first" gate banner. Visible when any
+                 person cluster has both name + first_name NULL — Deep
+                 Analyze on unnamed people produces less-useful captions
+                 ("a person at a party" vs "Adam at a party"). Mirror of
+                 macOS DeepAnalyzeView's `unnamedClustersWarning` strip. -->
+            <Border x:Name="NamePeopleGateBanner"
+                    CornerRadius="10"
+                    Padding="14,12"
+                    Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                    BorderBrush="{ThemeResource AiBrush}"
+                    BorderThickness="1"
+                    Visibility="Collapsed">
+                <Grid ColumnSpacing="12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Grid.Column="0"
+                              Glyph="&#xE77B;"
+                              FontSize="16"
+                              Foreground="{ThemeResource AiBrush}"
+                              VerticalAlignment="Top"
+                              Margin="0,2,0,0"
+                              AutomationProperties.AccessibilityView="Raw" />
+                    <TextBlock Grid.Column="1"
+                               x:Name="NamePeopleGateText"
+                               TextWrapping="Wrap"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Text="Name your people first so smart-name proposals can use their names." />
+                    <Button Grid.Column="2"
+                            x:Name="GoToPeopleButton"
+                            Content="Open People"
+                            Click="OnGoToPeopleClicked"
+                            VerticalAlignment="Center"
+                            AutomationProperties.Name="Open People"
+                            AutomationProperties.HelpText="Go to the People tab to name face clusters before analyzing" />
+                </Grid>
+            </Border>
+
+            <!-- Model picker — 3 cards. -->
+            <StackPanel Spacing="6">
+                <TextBlock Text="Choose a model"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                           FontWeight="SemiBold"
+                           CharacterSpacing="40"
+                           AutomationProperties.HeadingLevel="Level2" />
+                <Grid ColumnSpacing="12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border Grid.Column="0"
+                            x:Name="MistralCard"
+                            Visibility="Collapsed"
+                            CornerRadius="12"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            Padding="18"
+                            Tag="mistral_small_3_2"
+                            Tapped="OnModelCardTapped"
+                            AutomationProperties.Name="Mistral-Small 3.2 model"
+                            AutomationProperties.HelpText="Select this model. Approximately 15 GB disk, 16 GB RAM, max quality.">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Mistral-Small 3.2" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="≈15 GB disk · 16 GB RAM · max quality"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="MistralStatus"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource AiBrush}" />
+                            <ProgressBar x:Name="MistralProgress"
+                                         Value="0" Maximum="1"
+                                         Visibility="Collapsed"
+                                         Foreground="{ThemeResource GoldBrush}"
+                                         AutomationProperties.Name="Mistral-Small 3.2 download progress" />
+                            <Button Content="Install"
+                                    x:Name="MistralInstallButton"
+                                    Click="OnInstallModelClicked"
+                                    Tag="mistral_small_3_2"
+                                    Margin="0,4,0,0"
+                                    AutomationProperties.Name="Install Mistral-Small 3.2" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Column="0"
+                            x:Name="QwenLargeCard"
+                            Grid.ColumnSpan="3"
+                            MaxWidth="560"
+                            HorizontalAlignment="Stretch"
+                            CornerRadius="12"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            Padding="18"
+                            Tag="qwen3_vl_2b_ollama"
+                            Tapped="OnModelCardTapped"
+                            AutomationProperties.Name="Qwen3-VL 2B local model"
+                            AutomationProperties.HelpText="Uses the installed 1.9 GB Ollama model locally and unloads it after each batch.">
+                        <StackPanel Spacing="6">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Qwen3-VL 2B" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                                <Border Grid.Column="1"
+                                        Padding="6,2"
+                                        CornerRadius="4"
+                                        Background="{ThemeResource GoldSelectedBackgroundBrush}"
+                                        BorderBrush="{ThemeResource GoldSelectedStrokeBrush}"
+                                        BorderThickness="1">
+                                    <TextBlock Text="Local"
+                                               Style="{StaticResource CaptionTextBlockStyle}"
+                                               Foreground="{ThemeResource GoldBrush}"
+                                               FontWeight="SemiBold" />
+                                </Border>
+                            </Grid>
+                            <TextBlock Text="1.9 GB model · no cloud upload · unload after batch"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="QwenLargeStatus"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource AiBrush}" />
+                            <ProgressBar x:Name="QwenLargeProgress"
+                                         Value="0" Maximum="1"
+                                         Visibility="Collapsed"
+                                         Foreground="{ThemeResource GoldBrush}"
+                                         AutomationProperties.Name="Qwen 2.5-VL 7B download progress" />
+                            <Button Content="Install"
+                                    x:Name="QwenLargeInstallButton"
+                                    Click="OnInstallModelClicked"
+                                    Tag="qwen3_vl_2b_ollama"
+                                    Visibility="Collapsed"
+                                    Margin="0,4,0,0"
+                                    AutomationProperties.Name="Install Qwen 2.5-VL 7B" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Column="2"
+                            x:Name="GemmaCard"
+                            Visibility="Collapsed"
+                            CornerRadius="12"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            Padding="18"
+                            Tag="gemma_3_4b"
+                            Tapped="OnModelCardTapped"
+                            AutomationProperties.Name="Gemma 3 4B model"
+                            AutomationProperties.HelpText="Select this model. Approximately 2.5 GB disk, 4.5 GB RAM, balanced.">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Gemma 3 4B" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="≈2.5 GB disk · 4.5 GB RAM · balanced"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="GemmaStatus"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource AiBrush}" />
+                            <ProgressBar x:Name="GemmaProgress"
+                                         Value="0" Maximum="1"
+                                         Visibility="Collapsed"
+                                         Foreground="{ThemeResource GoldBrush}"
+                                         AutomationProperties.Name="Gemma 3 4B download progress" />
+                            <Button Content="Install"
+                                    x:Name="GemmaInstallButton"
+                                    Click="OnInstallModelClicked"
+                                    Tag="gemma_3_4b"
+                                    Margin="0,4,0,0"
+                                    AutomationProperties.Name="Install Gemma 3 4B" />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </StackPanel>
+
+            <!-- Run controls. -->
+            <Border CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="Generate rename suggestions"
+                               Style="{StaticResource SubtitleTextBlockStyle}"
+                               AutomationProperties.HeadingLevel="Level2" />
+                    <TextBlock x:Name="ActiveModelText"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Text="Active model: Qwen 2.5-VL 7B (best quality)" />
+                    <!-- Horizontal scroll so this action row never clips its
+                         right-hand controls (Propose renames / Cancel) on a
+                         narrow / laptop window. Mirrors the PeopleView +
+                         CleanupView header pattern. -->
+                    <ScrollViewer HorizontalScrollMode="Auto"
+                                  HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollMode="Disabled"
+                                  VerticalScrollBarVisibility="Disabled">
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Button Grid.Column="0"
+                                x:Name="AnalyzeAllButton"
+                                Click="OnAnalyzeAllClicked"
+                                Style="{StaticResource AccentButtonStyle}"
+                                AutomationProperties.Name="Analyze next review batch"
+                                AutomationProperties.HelpText="Analyze at most the next 100 eligible files so review stays responsive">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon Glyph="&#xE945;" FontSize="13" AutomationProperties.AccessibilityView="Raw" />
+                                <TextBlock Text="Next 100" />
+                            </StackPanel>
+                        </Button>
+                        <!-- Mirrors macOS DeepAnalyzeView's two extra actions:
+                             "Selected" (from a Library multi-select) + "Current"
+                             (from the focused FilePreviewSheet). Both pull their
+                             targets from SelectionRegistry; disabled when nothing
+                             matches. -->
+                        <Button Grid.Column="1"
+                                x:Name="AnalyzeSelectedButton"
+                                Click="OnAnalyzeSelectedClicked"
+                                ToolTipService.ToolTip="Analyze only files currently selected in the Library"
+                                AutomationProperties.HelpText="Analyze only files currently selected in the Library">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon Glyph="&#xE762;" FontSize="13" AutomationProperties.AccessibilityView="Raw" />
+                                <TextBlock x:Name="AnalyzeSelectedText" Text="Selected" />
+                            </StackPanel>
+                        </Button>
+                        <Button Grid.Column="2"
+                                x:Name="AnalyzeCurrentButton"
+                                Click="OnAnalyzeCurrentClicked"
+                                ToolTipService.ToolTip="Analyze only the file open in the preview sheet"
+                                AutomationProperties.Name="Analyze current file"
+                                AutomationProperties.HelpText="Analyze only the file open in the preview sheet">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon Glyph="&#xE890;" FontSize="13" AutomationProperties.AccessibilityView="Raw" />
+                                <TextBlock Text="Current" />
+                            </StackPanel>
+                        </Button>
+                        <ToggleSwitch Grid.Column="3"
+                                      x:Name="SkipExistingToggle"
+                                      IsOn="True"
+                                      OffContent="Re-analyze all"
+                                      OnContent="Skip already-analyzed"
+                                      Margin="14,0,0,0"
+                                      AutomationProperties.Name="Skip already-analyzed files"
+                                      AutomationProperties.HelpText="When on, files that already have a caption are skipped; when off, every file is re-analyzed" />
+                        <CheckBox Grid.Column="5"
+                                  x:Name="ProposeRenamesCheck"
+                                  Content="Propose renames"
+                                  IsChecked="True"
+                                  AutomationProperties.HelpText="When checked, the model also proposes smart filenames for each analyzed file" />
+                        <Button Grid.Column="6"
+                                x:Name="CancelButton"
+                                Content="Cancel"
+                                Click="OnCancelClicked"
+                                IsEnabled="False"
+                                AutomationProperties.HelpText="Stop the in-progress Deep Analyze run" />
+                    </Grid>
+                    </ScrollViewer>
+                </StackPanel>
+            </Border>
+
+            <!-- Live caption stream. -->
+            <Border x:Name="StreamCard"
+                    CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20"
+                    Visibility="Collapsed">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="Live caption" Style="{StaticResource SubtitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                    <Grid ColumnSpacing="14">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0"
+                                CornerRadius="8"
+                                Background="{ThemeResource SubtleFillColorTertiaryBrush}"
+                                Width="160" Height="160">
+                            <Image x:Name="StreamImage" Stretch="UniformToFill" Width="160" Height="160" AutomationProperties.Name="Preview of the file currently being analyzed" />
+                        </Border>
+                        <StackPanel Grid.Column="1" Spacing="8">
+                            <TextBlock x:Name="StreamFileNameText"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}"
+                                       TextTrimming="CharacterEllipsis" />
+                            <TextBlock x:Name="StreamCaptionText"
+                                       TextWrapping="Wrap"
+                                       Style="{StaticResource BodyTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="StreamProposedNameText"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource AiBrush}" />
+                        </StackPanel>
+                    </Grid>
+                    <ProgressBar x:Name="OverallProgress" Value="0" Maximum="1" AutomationProperties.Name="Deep Analyze overall progress" />
+                    <TextBlock x:Name="OverallProgressText"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                </StackPanel>
+            </Border>
+
+            <!-- smart-names pending-rename pill. Visible after
+                 Deep Analyze produces one or more ProposedName values.
+                 Tap routes back to the Library so the user can apply
+                 the proposed names via BulkRenameSheet. -->
+            <Button x:Name="ProposedNamesPill"
+                    Click="OnProposedNamesPillClicked"
+                    Visibility="Collapsed"
+                    HorizontalAlignment="Left"
+                    AutomationProperties.HelpText="Open the bulk rename sheet to apply the smart filenames the model proposed">
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <FontIcon Glyph="&#xE8AC;" FontSize="13" Foreground="{ThemeResource AiBrush}" AutomationProperties.AccessibilityView="Raw" />
+                    <TextBlock x:Name="ProposedNamesPillText"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                </StackPanel>
+            </Button>
+
+            <!-- Item 5: write tags / people / smart names onto the actual files.
+                 Tags + people are added as file tags (sidecar + IPropertyStore)
+                 so Windows Search finds the photos; Apply all also routes the
+                 pending smart-name renames through the review sheet. Mirror of
+                 the macOS DeepAnalyzeView applyActionsCard. -->
+            <Border x:Name="ApplyActionsCard"
+                    CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Padding="20">
+                <StackPanel Spacing="12">
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                        <FontIcon Glyph="&#xE74E;" FontSize="16" Foreground="{ThemeResource AiBrush}" AutomationProperties.AccessibilityView="Raw" />
+                        <TextBlock Text="Apply to your files" Style="{StaticResource SubtitleTextBlockStyle}" AutomationProperties.HeadingLevel="Level2" />
+                        <ProgressRing x:Name="ApplyProgressRing" Width="16" Height="16" IsActive="False" Visibility="Collapsed" />
+                    </StackPanel>
+                    <TextBlock TextWrapping="Wrap"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Text="Write what FileID found onto the files themselves. Tags and people are added as file tags so Windows Search finds your photos; Apply all also applies the smart names." />
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Button x:Name="ApplyTagsButton" Click="OnApplyTagsClicked"
+                                AutomationProperties.Name="Apply tags"
+                                AutomationProperties.HelpText="Write the keyword tags onto the files so Windows Search finds them.">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon FontSize="13" Glyph="&#xE8EC;" />
+                                <TextBlock Text="Apply tags" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="ApplyPeopleButton" Click="OnApplyPeopleClicked"
+                                AutomationProperties.Name="Apply people as tags"
+                                AutomationProperties.HelpText="Write each named person onto their photos as a file tag.">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon FontSize="13" Glyph="&#xE77B;" />
+                                <TextBlock Text="Apply people as tags" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="ApplyAllButton" Click="OnApplyAllClicked"
+                                Style="{StaticResource AccentButtonStyle}"
+                                AutomationProperties.Name="Apply all"
+                                AutomationProperties.HelpText="Apply smart names, tags, and people all at once.">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon FontSize="13" Glyph="&#xE73E;" />
+                                <TextBlock Text="Apply all" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                    <TextBlock x:Name="ApplyStatusText"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Visibility="Collapsed" />
+                </StackPanel>
+            </Border>
+
+            <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                       TextWrapping="Wrap"
+                       Text="Qwen3-VL dikelola oleh Ollama. Folder Vision tidak mengunduh model otomatis dan tidak mengirim file ke cloud." />
+
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>
