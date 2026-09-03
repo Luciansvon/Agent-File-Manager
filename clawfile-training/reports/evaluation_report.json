@@ -1,0 +1,336 @@
+{
+  "summary": {
+    "model_evaluated": "clawfile-agent:latest",
+    "benchmark_file": "C:\\Users\\shint\\Documents\\FolderVisionAI-FileID\\clawfile-training\\benchmarks\\frozen_test_benchmark.jsonl",
+    "total_test_samples": 35,
+    "file_tasks_count": 14,
+    "chat_tasks_count": 21,
+    "evaluation_time_seconds": 137.2,
+    "overall_benchmark_score": 97.14,
+    "category_accuracy": {
+      "FILE_ORGANIZING": 100.0,
+      "CONVERSATION": 95.24
+    },
+    "quality_indicators": {
+      "think_tag_compliance_pct": 100.0,
+      "safe_windows_filename_pct": 100.0
+    }
+  },
+  "details": [
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0131"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0073"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0156"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0020"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0041"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0048"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0157"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0172"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0118"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0046"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0018"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0125"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0033"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0045"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0044"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0057"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0176"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 0.5,
+      "sample_id": "sample_0083"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0053"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0008"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0065"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0063"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 0.5,
+      "sample_id": "sample_0079"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0047"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0123"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0095"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0085"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0106"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0064"
+    },
+    {
+      "is_file_task": true,
+      "category": "FILE_ORGANIZING",
+      "has_think": true,
+      "has_filename": true,
+      "safe_filename": true,
+      "score": 1.0,
+      "sample_id": "sample_0006"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0066"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0096"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0098"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0104"
+    },
+    {
+      "is_file_task": false,
+      "category": "CONVERSATION",
+      "has_think": true,
+      "has_filename": false,
+      "safe_filename": false,
+      "score": 1.0,
+      "sample_id": "sample_0091"
+    }
+  ]
+}

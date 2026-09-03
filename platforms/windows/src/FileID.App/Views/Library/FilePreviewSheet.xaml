@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
     FilePreviewSheet — modal preview matching macOS LibraryView.swift:882-1115.
 
@@ -202,6 +202,46 @@
                                TextAlignment="Center"
                                MaxWidth="380"
                                TextWrapping="Wrap" />
+                </StackPanel>
+
+                <!-- Audio visual overlay: shown ON TOP of the MediaPlayerElement
+                     when playing audio files. MediaPlayerElement renders a black
+                     surface for audio-only files; this panel covers it with a
+                     meaningful visual (music icon + filename + format badge)
+                     while the transport controls below it still work. -->
+                <StackPanel x:Name="AudioPreviewPanel"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Spacing="16"
+                            Visibility="Collapsed">
+                    <Border Width="96" Height="96"
+                            CornerRadius="48"
+                            Background="#33B19BCE"
+                            HorizontalAlignment="Center">
+                        <FontIcon Glyph="&#xEC4F;"
+                                  FontSize="48"
+                                  Foreground="#B19BCE"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center" />
+                    </Border>
+                    <TextBlock x:Name="AudioFileNameText"
+                               Style="{StaticResource SubtitleTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorPrimaryBrush}"
+                               HorizontalAlignment="Center"
+                               TextAlignment="Center"
+                               MaxWidth="400"
+                               TextTrimming="CharacterEllipsis"
+                               MaxLines="2" />
+                    <Border Background="#44B19BCE"
+                            CornerRadius="6"
+                            Padding="12,4"
+                            HorizontalAlignment="Center">
+                        <TextBlock x:Name="AudioFormatBadge"
+                                   FontSize="12"
+                                   FontWeight="SemiBold"
+                                   Foreground="#B19BCE"
+                                   HorizontalAlignment="Center" />
+                    </Border>
                 </StackPanel>
 
                 <!-- Loading indicator while the thumbnail / media source resolves. -->

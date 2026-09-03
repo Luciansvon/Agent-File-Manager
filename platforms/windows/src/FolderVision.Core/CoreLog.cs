@@ -1,4 +1,4 @@
-namespace FolderVision.Core;
+﻿namespace FolderVision.Core;
 
 internal static class CoreLog
 {

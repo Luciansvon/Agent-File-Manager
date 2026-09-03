@@ -149,3 +149,14 @@ __pycache__/
 .env
 .env.local
 user.md
+
+# ─── AI Training & Heavy Model Weights (Exclude from Git) ───────────────────
+clawfile-training/experiments/
+clawfile-training/mock_sandbox/
+clawfile-training/checkpoints/
+clawfile-training/unsloth_compiled_cache/
+clawfile-training/telegram_state.json
+clawfile-training/telegram_offset.txt
+dataset_latihan/
+node_modules/
+unsloth_compiled_cache/

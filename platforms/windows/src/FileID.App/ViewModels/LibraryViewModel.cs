@@ -884,6 +884,57 @@ internal sealed class FileTile : INotifyPropertyChanged
     /// <summary>Modified-at unix seconds, used as part of the thumbnail cache key.</summary>
     public double? ModifiedAt { get; init; }
 
+    /// <summary>Uppercase format badge text (e.g. "PDF", "DOCX", "MP3", "WAV", "MP4").</summary>
+    public string FormatBadgeText
+    {
+        get
+        {
+            var ext = System.IO.Path.GetExtension(Path)?.TrimStart('.').ToUpperInvariant();
+            if (!string.IsNullOrEmpty(ext)) return ext;
+            return Kind switch
+            {
+                "image" => "IMG",
+                "video" => "VID",
+                "audio" => "AUD",
+                "pdf" => "PDF",
+                "doc" => "DOC",
+                _ => "FILE"
+            };
+        }
+    }
+
+    /// <summary>Format-specific glyph for the tile placeholder.</summary>
+    public string FormatGlyph
+    {
+        get
+        {
+            var ext = System.IO.Path.GetExtension(Path)?.TrimStart('.').ToLowerInvariant();
+            return ext switch
+            {
+                "pdf" => "", // PDF
+                "doc" or "docx" => "", // Document
+                "xls" or "xlsx" or "csv" => "", // Spreadsheet / Table
+                "ppt" or "pptx" => "", // Presentation
+                "mp3" or "wav" or "flac" or "m4a" or "aac" or "wma" or "ogg" => "", // MusicNote
+                "mp4" or "mkv" or "mov" or "avi" or "wmv" or "webm" => "", // Video
+                "zip" or "rar" or "7z" or "tar" or "gz" => "", // Archive
+                "txt" or "md" or "json" or "xml" or "yaml" or "yml" or "cs" or "rs" or "py" or "js" or "ts" or "html" or "css" => "", // Code/Text
+                _ => Kind switch
+                {
+                    "image" => "",
+                    "video" => "",
+                    "audio" => "",
+                    "pdf" => "",
+                    "doc" => "",
+                    _ => ""
+                }
+            };
+        }
+    }
+
+    public Microsoft.UI.Xaml.Media.SolidColorBrush FormatAccentBrush => FormatBrushes.GetAccentBrush(Path, Kind);
+    public Microsoft.UI.Xaml.Media.SolidColorBrush FormatBgBrush => FormatBrushes.GetBgBrush(Path, Kind);
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public static FileTile From(FileRow r)
@@ -928,4 +979,80 @@ internal sealed class FileTile : INotifyPropertyChanged
         if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):0.#} MB";
         return $"{bytes / (1024.0 * 1024 * 1024):0.##} GB";
     }
+}
+
+internal static class FormatBrushes
+{
+    private static readonly Dictionary<string, Microsoft.UI.Xaml.Media.SolidColorBrush> s_accentBrushes = new();
+    private static readonly Dictionary<string, Microsoft.UI.Xaml.Media.SolidColorBrush> s_bgBrushes = new();
+
+    public static Microsoft.UI.Xaml.Media.SolidColorBrush GetAccentBrush(string path, string kind)
+    {
+        var key = GetFormatKey(path, kind);
+        if (s_accentBrushes.TryGetValue(key, out var b)) return b;
+        var color = GetAccentColor(key);
+        var brush = new Microsoft.UI.Xaml.Media.SolidColorBrush(color);
+        s_accentBrushes[key] = brush;
+        return brush;
+    }
+
+    public static Microsoft.UI.Xaml.Media.SolidColorBrush GetBgBrush(string path, string kind)
+    {
+        var key = GetFormatKey(path, kind);
+        if (s_bgBrushes.TryGetValue(key, out var b)) return b;
+        var color = GetBgColor(key);
+        var brush = new Microsoft.UI.Xaml.Media.SolidColorBrush(color);
+        s_bgBrushes[key] = brush;
+        return brush;
+    }
+
+    private static string GetFormatKey(string path, string kind)
+    {
+        var ext = System.IO.Path.GetExtension(path)?.TrimStart('.').ToLowerInvariant();
+        return ext switch
+        {
+            "pdf" => "pdf",
+            "doc" or "docx" => "word",
+            "xls" or "xlsx" or "csv" => "excel",
+            "ppt" or "pptx" => "ppt",
+            "mp3" or "wav" or "flac" or "m4a" or "aac" or "wma" or "ogg" => "audio",
+            "mp4" or "mkv" or "mov" or "avi" or "wmv" or "webm" => "video",
+            "zip" or "rar" or "7z" or "tar" or "gz" => "archive",
+            "txt" or "md" or "json" or "xml" or "yaml" or "yml" or "cs" or "rs" or "py" or "js" or "ts" or "html" or "css" => "code",
+            _ => kind switch
+            {
+                "pdf" => "pdf",
+                "doc" => "word",
+                "audio" => "audio",
+                "video" => "video",
+                _ => "generic"
+            }
+        };
+    }
+
+    private static Windows.UI.Color GetAccentColor(string key) => key switch
+    {
+        "pdf" => Windows.UI.Color.FromArgb(0xFF, 0xE0, 0x48, 0x48), // Red
+        "word" => Windows.UI.Color.FromArgb(0xFF, 0x2B, 0x57, 0x9A), // Word Blue
+        "excel" => Windows.UI.Color.FromArgb(0xFF, 0x21, 0x73, 0x46), // Excel Green
+        "ppt" => Windows.UI.Color.FromArgb(0xFF, 0xD2, 0x47, 0x26), // PPT Orange
+        "audio" => Windows.UI.Color.FromArgb(0xFF, 0xB1, 0x9B, 0xCE), // Audio Lavender
+        "video" => Windows.UI.Color.FromArgb(0xFF, 0x48, 0x95, 0xEF), // Video Cyan
+        "archive" => Windows.UI.Color.FromArgb(0xFF, 0xF7, 0x7F, 0x00), // Archive Amber
+        "code" => Windows.UI.Color.FromArgb(0xFF, 0x4C, 0xC9, 0xF0), // Code Teal
+        _ => Windows.UI.Color.FromArgb(0xFF, 0x9E, 0x9E, 0xA6) // Default Gray
+    };
+
+    private static Windows.UI.Color GetBgColor(string key) => key switch
+    {
+        "pdf" => Windows.UI.Color.FromArgb(0x28, 0xE0, 0x48, 0x48),
+        "word" => Windows.UI.Color.FromArgb(0x28, 0x2B, 0x57, 0x9A),
+        "excel" => Windows.UI.Color.FromArgb(0x28, 0x21, 0x73, 0x46),
+        "ppt" => Windows.UI.Color.FromArgb(0x28, 0xD2, 0x47, 0x26),
+        "audio" => Windows.UI.Color.FromArgb(0x28, 0xB1, 0x9B, 0xCE),
+        "video" => Windows.UI.Color.FromArgb(0x28, 0x48, 0x95, 0xEF),
+        "archive" => Windows.UI.Color.FromArgb(0x28, 0xF7, 0x7F, 0x00),
+        "code" => Windows.UI.Color.FromArgb(0x28, 0x4C, 0xC9, 0xF0),
+        _ => Windows.UI.Color.FromArgb(0x1F, 0x9E, 0x9E, 0xA6)
+    };
 }

@@ -1,0 +1,19 @@
+{
+  "total_raw_rows_scanned": 268,
+  "unique_samples": 184,
+  "duplicates_removed": 84,
+  "corrupted_rows": 0,
+  "categories": {
+    "VISION": 61,
+    "DOCUMENT": 17,
+    "FILE_MANAGEMENT": 24,
+    "CONVERSATION": 82
+  },
+  "quality_metrics": {
+    "valid_json_rate": 1.0,
+    "empty_responses": 0,
+    "has_think_reasoning": 60,
+    "windows_filename_clean": 67,
+    "windows_filename_violations": 0
+  }
+}

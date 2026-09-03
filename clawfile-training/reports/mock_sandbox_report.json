@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-09-03 20:30:02",
+  "total_files_tested": 5,
+  "successful_moves": 3,
+  "success_rate_pct": 60.0,
+  "windows_safe_compliance_pct": 100.0,
+  "extension_preserved_pct": 100.0,
+  "destructive_file_loss": 0,
+  "details": [
+    {
+      "original_file": "SKP-2026-FINAL-v2.pdf",
+      "suggested_name": "laporan-ekvaluasi-praktik-industri-bima-chakti-mei-2026.pdf",
+      "target_folder": "05_foto_dokumentasi",
+      "expected_folder": "06_dokumen_laporan",
+      "windows_safe": true,
+      "extension_preserved": true,
+      "folder_correct": false,
+      "action_executed": true,
+      "duration_s": 4.09
+    },
+    {
+      "original_file": "img_render_kursi_jati_019.png",
+      "suggested_name": "render_kursi_santai_kayu_jati.png",
+      "target_folder": "03_render_furnitur",
+      "expected_folder": "03_render_furnitur",
+      "windows_safe": true,
+      "extension_preserved": true,
+      "folder_correct": true,
+      "action_executed": true,
+      "duration_s": 3.57
+    },
+    {
+      "original_file": "poster_promo_kopi_umkm.jpg",
+      "suggested_name": "poster-promosi-kopi-susu-gula-aren.jpg",
+      "target_folder": "01_poster_iklan",
+      "expected_folder": "01_poster_iklan",
+      "windows_safe": true,
+      "extension_preserved": true,
+      "folder_correct": true,
+      "action_executed": true,
+      "duration_s": 2.71
+    },
+    {
+      "original_file": "logo_brand_pijar_vector.svg",
+      "suggested_name": "logo_brand_pijar_sukma_jepara.svg",
+      "target_folder": "02_desain_logo",
+      "expected_folder": "02_desain_logo",
+      "windows_safe": true,
+      "extension_preserved": true,
+      "folder_correct": true,
+      "action_executed": true,
+      "duration_s": 3.87
+    },
+    {
+      "original_file": "invoice_pembelian_kayu_1029.pdf",
+      "suggested_name": "invoice_pembelian_kayu_log_jati_15m3.pdf",
+      "target_folder": "05_foto_dokumentasi",
+      "expected_folder": "06_dokumen_laporan",
+      "windows_safe": true,
+      "extension_preserved": true,
+      "folder_correct": false,
+      "action_executed": true,
+      "duration_s": 3.36
+    }
+  ]
+}

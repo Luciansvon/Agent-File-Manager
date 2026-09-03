@@ -212,6 +212,7 @@ public sealed partial class FilePreviewSheet : UserControl
         // paths each collapse PreviewImage when they show their own surface.
         StopAndClearMedia();
         PreviewMedia.Visibility = Visibility.Collapsed;
+        AudioPreviewPanel.Visibility = Visibility.Collapsed;
         PlaceholderPanel.Visibility = Visibility.Collapsed;
         // Defer the loading ring: arrow-key sibling nav is usually a cache-warm
         // load that resolves in well under 100 ms. Collapsing the prior image
@@ -414,6 +415,41 @@ public sealed partial class FilePreviewSheet : UserControl
                 Services.DebugLog.Warn($"FilePreviewSheet direct image preview failed: {ex.Message}");
             }
         }
+
+        // Direct PDF first-page render fallback via Windows.Data.Pdf when shell preview is unavailable
+        if (kind == "pdf" && dispatcher != null)
+        {
+            try
+            {
+                var storageFile = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
+                var pdfDoc = await Windows.Data.Pdf.PdfDocument.LoadFromFileAsync(storageFile);
+                if (pdfDoc.PageCount > 0)
+                {
+                    using var page = pdfDoc.GetPage(0);
+                    using var memStream = new Windows.Storage.Streams.InMemoryRandomAccessStream();
+                    var renderOptions = new Windows.Data.Pdf.PdfPageRenderOptions
+                    {
+                        DestinationWidth = 1024
+                    };
+                    await page.RenderToStreamAsync(memStream, renderOptions);
+                    if (memStream.Size > 0)
+                    {
+                        var pdfBytes = new byte[memStream.Size];
+                        using var reader = new Windows.Storage.Streams.DataReader(memStream.GetInputStreamAt(0));
+                        await reader.LoadAsync((uint)memStream.Size);
+                        reader.ReadBytes(pdfBytes);
+                        if (await TryRenderPreviewBytesAsync(pdfBytes, cacheKey, dispatcher, navGen, kind, "pdf-direct"))
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Services.DebugLog.Warn($"FilePreviewSheet Windows.Data.Pdf render failed: {ex.Message}");
+            }
+        }
         // Don't show the failure placeholder if we navigated away (or the stale
         // guard above set tcs=false for a superseded nav) — otherwise the prior
         // file's load clobbers the CURRENT sibling's preview with a placeholder.
@@ -584,12 +620,34 @@ public sealed partial class FilePreviewSheet : UserControl
             PreviewImage.Visibility = Visibility.Collapsed;
             PreviewMedia.Source = src;
             PreviewMedia.Visibility = Visibility.Visible;
+
+            if (kind == "audio")
+            {
+                AudioFileNameText.Text = Path.GetFileName(path);
+                var ext = Path.GetExtension(path)?.TrimStart('.').ToUpperInvariant();
+                AudioFormatBadge.Text = (!string.IsNullOrEmpty(ext) ? ext : "AUDIO") + " AUDIO";
+                AudioPreviewPanel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                AudioPreviewPanel.Visibility = Visibility.Collapsed;
+            }
+
             // Attach failure handler on the (lazily-created) MediaPlayer; detach
             // first so rapid sibling navigation can't multi-subscribe.
             if (PreviewMedia.MediaPlayer is { } mp)
             {
                 mp.MediaFailed -= OnMediaPlayerFailed;
                 mp.MediaFailed += OnMediaPlayerFailed;
+                if (kind == "video")
+                {
+                    void OnMediaOpened(Windows.Media.Playback.MediaPlayer s, object a)
+                    {
+                        s.MediaOpened -= OnMediaOpened;
+                        try { s.StepForwardOneFrame(); } catch { }
+                    }
+                    mp.MediaOpened += OnMediaOpened;
+                }
             }
         }
         catch (Exception ex)
@@ -627,6 +685,7 @@ public sealed partial class FilePreviewSheet : UserControl
     {
         PreviewImage.Visibility = Visibility.Collapsed;
         PreviewMedia.Visibility = Visibility.Collapsed;
+        AudioPreviewPanel.Visibility = Visibility.Collapsed;
         PlaceholderPanel.Visibility = Visibility.Visible;
         PlaceholderText.Text = caption;
     }
@@ -638,6 +697,10 @@ public sealed partial class FilePreviewSheet : UserControl
         _mediaGen++;
         try
         {
+            if (AudioPreviewPanel != null)
+            {
+                AudioPreviewPanel.Visibility = Visibility.Collapsed;
+            }
             // MediaPlayer is null until Source is set; guard before
             // touching to avoid an NRE on the initial hide pass.
             if (PreviewMedia?.MediaPlayer is { } mp)
@@ -977,9 +1040,9 @@ public sealed partial class FilePreviewSheet : UserControl
         // Segoe Fluent Icons — match the tile-level glyphs.
         "image" => "", // Photo
         "video" => "", // Video
-        "pdf" => "", // Document
+        "pdf" => "", // PDF
         "doc" => "", // Document
-        "audio" => "", // MusicNote
+        "audio" => "", // MusicNote
         _ => "", // Folder / generic
     };
 

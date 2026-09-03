@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using FileID.IpcSchema;
 
 namespace FolderVision.Core;
@@ -315,7 +315,10 @@ internal sealed class BackgroundIndexService : IAsyncDisposable
                     stableSamples++;
                     if (stableSamples >= 2
                         && DateTime.UtcNow - current.LastWriteTimeUtc >= DebounceDelay
-                        && CanOpenWithoutWriter(path)) return true;
+                        && CanOpenWithoutWriter(path))
+                    {
+                        return true;
+                    }
                 }
                 else
                 {
@@ -487,7 +490,11 @@ internal sealed class BackgroundIndexService : IAsyncDisposable
         foreach (var root in roots.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(path => path.Length))
         {
             if (selected.Any(parent => root.StartsWith(parent.TrimEnd(Path.DirectorySeparatorChar)
-                + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))) continue;
+                + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
             selected.Add(root);
         }
         return selected.ToArray();

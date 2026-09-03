@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
     OnboardingSplash — focused 4-step workflow on the empty Detail when no
     folder is picked.
@@ -25,7 +25,7 @@
                      The LinearGradientBrush's EndPoint is animated by code-behind
                      over 12 s; ReducedMotion freezes it on solid gold. -->
                 <TextBlock x:Name="TitleText"
-                           Text="Folder Vision"
+                           Text="ClawFile"
                            FontSize="56"
                            FontWeight="Bold"
                            HorizontalAlignment="Center"

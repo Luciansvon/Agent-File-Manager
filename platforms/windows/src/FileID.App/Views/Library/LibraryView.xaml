@@ -346,17 +346,30 @@
                                            Stretch="UniformToFill"
                                            HorizontalAlignment="Stretch"
                                            VerticalAlignment="Stretch" />
-                                    <!-- Broken-image placeholder when
-                                         ThumbnailService.RequestAsync
-                                         returns null after exhausting its
-                                         fallback chain. Procedural FontIcon
-                                         so no Assets bookkeeping. -->
-                                    <FontIcon Glyph="&#xE91F;"
-                                              FontSize="48"
-                                              Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                                              HorizontalAlignment="Center"
-                                              VerticalAlignment="Center"
-                                              Visibility="{x:Bind ThumbnailFailed, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                                    <!-- Format placeholder card when thumbnail is unavailable (audio, video without poster, document, etc.) -->
+                                    <Grid Visibility="{x:Bind ThumbnailFailed, Mode=OneWay, Converter={StaticResource BoolToVisibility}}"
+                                          Background="{x:Bind FormatBgBrush, Mode=OneWay}"
+                                          HorizontalAlignment="Stretch"
+                                          VerticalAlignment="Stretch">
+                                        <StackPanel VerticalAlignment="Center"
+                                                    HorizontalAlignment="Center"
+                                                    Spacing="8">
+                                            <FontIcon Glyph="{x:Bind FormatGlyph, Mode=OneWay}"
+                                                      FontSize="40"
+                                                      Foreground="{x:Bind FormatAccentBrush, Mode=OneWay}"
+                                                      HorizontalAlignment="Center" />
+                                            <Border Background="{x:Bind FormatAccentBrush, Mode=OneWay}"
+                                                    CornerRadius="4"
+                                                    Padding="6,2"
+                                                    HorizontalAlignment="Center">
+                                                <TextBlock Text="{x:Bind FormatBadgeText, Mode=OneWay}"
+                                                           FontSize="10"
+                                                           FontWeight="Bold"
+                                                           Foreground="White"
+                                                           HorizontalAlignment="Center" />
+                                            </Border>
+                                        </StackPanel>
+                                    </Grid>
                                 </Grid>
                             </Border>
                             <Border

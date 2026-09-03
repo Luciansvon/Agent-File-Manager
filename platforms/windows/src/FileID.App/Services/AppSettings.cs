@@ -1,4 +1,4 @@
-﻿// AppSettings — durable user preferences.
+// AppSettings — durable user preferences.
 //
 // Persisted as JSON at %LOCALAPPDATA%\FileID\app-settings.json. Atomic
 // writes via temp-file + File.Move so a crash mid-save doesn't corrupt
@@ -111,7 +111,7 @@ internal sealed class AppSettings
     /// tab uses for full caption + smart-rename + tags. Auto-tagging during
     /// scans uses RAM++ (CLIP scene tags as fallback); this is the opt-in
     /// higher-quality path. Accepted values mirror registry.rs ids
-    /// The Folder Vision default is the already-installed local Ollama model;
+    /// The ClawFile default is the already-installed local Ollama model;
     /// the application never pulls it implicitly.</summary>
     public string SelectedVlmModelKind { get; set; } = "qwen3_vl_2b_ollama";
 
@@ -206,7 +206,7 @@ internal sealed class AppSettings
             DebugLog.Info("AppSettings: migrating Deep Analyze model qwen2_5_vl_3b → qwen2_5_vl_7b (schema v5; non-commercial 3B removed).");
             s.SelectedVlmModelKind = "qwen2_5_vl_7b";
         }
-        // v6: the final Folder Vision architecture uses the much smaller local
+        // v6: the final ClawFile architecture uses the much smaller local
         // Qwen3-VL 2B through Ollama and unloads it after each review batch.
         if (s.SchemaVersion < 6)
         {

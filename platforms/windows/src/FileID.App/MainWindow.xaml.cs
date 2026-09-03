@@ -1,4 +1,4 @@
-﻿// MainWindow code-behind — chrome (Mica/Acrylic, dark mode, custom title
+// MainWindow code-behind — chrome (Mica/Acrylic, dark mode, custom title
 // bar, min size), sidebar visibility binding, drag-drop folder, and the
 // app-level keyboard accelerators (Alt+1..4, Ctrl+O, Ctrl+R, Ctrl+F,
 // Ctrl+Shift+S).
@@ -112,7 +112,7 @@ public sealed partial class MainWindow : Window
         // window to show. Let it propagate up to the App handler.
         Trace("InitializeComponent");
         InitializeComponent();
-        Title = "Folder Vision AI";
+        Title = "ClawFile";
 
         Step("ApplyTitleBarChrome", ApplyTitleBarChrome);
         Step("ApplyMinimumSize", ApplyMinimumSize);
@@ -128,7 +128,7 @@ public sealed partial class MainWindow : Window
         Step("AppViewModel subscribe", () => AppViewModel.Instance.PropertyChanged += OnAppViewModelChanged);
         Step("ApplySidebarVisibility", ApplySidebarVisibility);
 
-        // Folder Vision starts usable with local parsers, OCR and the existing
+        // ClawFile starts usable with local parsers, OCR and the existing
         // Ollama integration. Legacy FileID model packs remain optional in
         // Settings; never block first launch with a multi-gigabyte installer.
         Step("Initial window activation", () =>
@@ -510,7 +510,7 @@ public sealed partial class MainWindow : Window
         AddAccelerator(VirtualKey.F, VirtualKeyModifiers.Control,
             (_, _) => SearchFocusRequested?.Invoke(this, EventArgs.Empty));
 
-        // Alt+1..4 — jump to the focused Folder Vision destinations.
+        // Alt+1..4 — jump to the focused ClawFile destinations.
         for (int i = 0; i < SidebarTab.All.Count; i++)
         {
             int idx = i;

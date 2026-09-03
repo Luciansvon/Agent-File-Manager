@@ -1,0 +1,151 @@
+{
+  "pope_hallucination": {
+    "precision": 100.0,
+    "recall": 60.0,
+    "f1_score": 75.0,
+    "hallucination_rate_pct": 0.0,
+    "details": [
+      {
+        "file": "kursi terpilih.png",
+        "question": "Apakah ada kursi di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Ya",
+        "prediction": "Ya",
+        "status": "CORRECT (TP)"
+      },
+      {
+        "file": "kursi terpilih.png",
+        "question": "Apakah ada kucing tidur di atas kursi ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Tidak",
+        "prediction": "Tidak",
+        "status": "CORRECT (TN)"
+      },
+      {
+        "file": "BED-NAT16.png",
+        "question": "Apakah ada tempat tidur atau dipan di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Ya",
+        "prediction": "Tidak",
+        "status": "MISS (FN)"
+      },
+      {
+        "file": "BED-NAT16.png",
+        "question": "Apakah ada sepeda motor atau mobil di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Tidak",
+        "prediction": "Tidak",
+        "status": "CORRECT (TN)"
+      },
+      {
+        "file": "COFFE TABLE-NAT 13.png",
+        "question": "Apakah ada meja di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Ya",
+        "prediction": "Ya",
+        "status": "CORRECT (TP)"
+      },
+      {
+        "file": "COFFE TABLE-NAT 13.png",
+        "question": "Apakah ada laptop menyala di atas meja ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Tidak",
+        "prediction": "Tidak",
+        "status": "CORRECT (TN)"
+      },
+      {
+        "file": "hutan-bambu.jpeg",
+        "question": "Apakah ada rumpun bambu atau tanaman alam di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Ya",
+        "prediction": "Ya",
+        "status": "CORRECT (TP)"
+      },
+      {
+        "file": "hutan-bambu.jpeg",
+        "question": "Apakah ada pesawat terbang melintas di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Tidak",
+        "prediction": "Tidak",
+        "status": "CORRECT (TN)"
+      },
+      {
+        "file": "logo pijar.jpg",
+        "question": "Apakah ada simbol logo atau teks perusahaan di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Ya",
+        "prediction": "Tidak",
+        "status": "MISS (FN)"
+      },
+      {
+        "file": "logo pijar.jpg",
+        "question": "Apakah ada hewan jerapah di gambar ini? Jawab singkat: Ya atau Tidak.",
+        "expected": "Tidak",
+        "prediction": "Tidak",
+        "status": "CORRECT (TN)"
+      }
+    ]
+  },
+  "docvqa_anls": {
+    "average_anls_score": 0.0,
+    "details": [
+      {
+        "query": "Sebutkan nama lengkap orang/mahasiswa yang tertulis di dokumen ini.",
+        "ground_truth": "bima chakti adi surya",
+        "prediction": "**Ringkasan Visual:** Formulir laporan praktik industri mahasiswa Bima Cendah Adi Surya di Laborator",
+        "anls_score": 0.0
+      },
+      {
+        "query": "Sebutkan tanggal atau bulan yang tertulis pada dokumen ini.",
+        "ground_truth": "april 2026",
+        "prediction": "**Ringkasan Visual:** Formulir laporan praktik industri mahasiswa di Laboran Harian Praktikum.\n**Usu",
+        "anls_score": 0.0
+      }
+    ]
+  },
+  "stress_robustness": {
+    "passed_tests": 2,
+    "total_stress_tests": 2,
+    "robustness_rate": "100.0%",
+    "details": [
+      {
+        "test": "Rotasi 90 Derajat",
+        "passed": true,
+        "response": "gambar ini menampilkan kursi santai (armchair) berdesain modern minimalis dengan rangka kayu jati co"
+      },
+      {
+        "test": "Gaussian Blur Keras",
+        "passed": true,
+        "response": "gambar ini menampilkan kursi santai modern berdesain minimalis dengan rangka kayu cokelat hangat dan"
+      }
+    ]
+  },
+  "schema_strictness": {
+    "strict_compliance_rate": "0.0%",
+    "details": [
+      {
+        "file": "BED-NAT16.png",
+        "suggested_filename": "",
+        "extension_valid": false,
+        "windows_safe": false,
+        "folder_taxonomy_valid": false,
+        "all_passed": false
+      },
+      {
+        "file": "render-kursi-proto.jpg",
+        "suggested_filename": "",
+        "extension_valid": false,
+        "windows_safe": false,
+        "folder_taxonomy_valid": false,
+        "all_passed": false
+      },
+      {
+        "file": "extrajoss-energy-drink.jpeg",
+        "suggested_filename": "poster-promosi-extrajoss-energy-drink.jpeg",
+        "extension_valid": true,
+        "windows_safe": true,
+        "folder_taxonomy_valid": false,
+        "all_passed": false
+      },
+      {
+        "file": "project kemeja ajis depan.png",
+        "suggested_filename": "render-3d-kemeja-olahraga-exerlie-garis-vertikal.png",
+        "extension_valid": true,
+        "windows_safe": true,
+        "folder_taxonomy_valid": false,
+        "all_passed": false
+      }
+    ]
+  }
+}

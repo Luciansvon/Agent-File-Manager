@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
     DeepAnalyzeView — VLM picker + analyze controls + live caption
     stream.
@@ -471,7 +471,7 @@
             <TextBlock Style="{StaticResource CaptionTextBlockStyle}"
                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                        TextWrapping="Wrap"
-                       Text="Qwen3-VL dikelola oleh Ollama. Folder Vision tidak mengunduh model otomatis dan tidak mengirim file ke cloud." />
+                       Text="Qwen3-VL dikelola oleh Ollama. ClawFile tidak mengunduh model otomatis dan tidak mengirim file ke cloud." />
 
         </StackPanel>
     </ScrollViewer>

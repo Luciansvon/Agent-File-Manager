@@ -1,4 +1,4 @@
-﻿// Application root — owns the single MainWindow and the lifetime of every
+// Application root — owns the single MainWindow and the lifetime of every
 // app-level service (EngineClient, model installers, settings store).
 //
 // On macOS this is FileIDApp.swift + AppDelegate. On Windows the WinUI
@@ -110,8 +110,8 @@ public partial class App : Application
                         string? body = null;
                         if (reason.Contains("not found", StringComparison.OrdinalIgnoreCase))
                         {
-                            title = "Folder Vision — background core missing";
-                            body = "Folder Vision couldn't find its background core.\n\n" +
+                            title = "ClawFile — background core missing";
+                            body = "ClawFile couldn't find its background core.\n\n" +
                                    $"Expected at:\n{AppPaths.CoreExePath}\n\n" +
                                    "If you built from source, run the Windows build script. " +
                                    "If you installed FileID via MSI, the install is incomplete — reinstall from your downloaded MSI.\n\n" +

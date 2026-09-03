@@ -1,4 +1,4 @@
-﻿// ReadStore — app-side read-only SQLite access.
+// ReadStore — app-side read-only SQLite access.
 //
 // The engine owns the writer connection (rusqlite, single-threaded by
 // design — see platforms/apple/CLAUDE.md and engine/src/db/mod.rs). The
@@ -164,7 +164,7 @@ internal sealed class ReadStore : IAsyncDisposable, IDisposable, INotifyProperty
 
     /// <summary>
     /// FTS5-backed full-text search over filename, OCR, documents, and the
-    /// canonical Folder Vision content chunks. Uses the same match-expression
+    /// canonical ClawFile content chunks. Uses the same match-expression
     /// shape as macOS — whitespace-joined terms.
     /// </summary>
     public async Task<IReadOnlyList<FileRow>> SearchAsync(

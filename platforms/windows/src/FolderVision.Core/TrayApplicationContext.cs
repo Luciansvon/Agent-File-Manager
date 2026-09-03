@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
 
 namespace FolderVision.Core;
@@ -18,17 +18,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
         StorageZoneDiscovery.Save(zones);
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Open Folder Vision", null, (_, _) => OpenUi());
+        menu.Items.Add("Open ClawFile", null, (_, _) => OpenUi());
         _pauseItem = new ToolStripMenuItem();
         _pauseItem.Click += (_, _) => TogglePause();
         menu.Items.Add(_pauseItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit Folder Vision Core", null, (_, _) => ExitThread());
+        menu.Items.Add("Exit ClawFile Core", null, (_, _) => ExitThread());
 
         _tray = new NotifyIcon
         {
             Icon = SystemIcons.Application,
-            Text = "Folder Vision - Active",
+            Text = "ClawFile - Active",
             ContextMenuStrip = menu,
             Visible = true,
         };
@@ -61,8 +61,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
         SyncPauseText();
         _tray.Text = AutomationState.IsPaused
-            ? "Folder Vision - Automation paused"
-            : "Folder Vision - Active";
+            ? "ClawFile - Automation paused"
+            : "ClawFile - Active";
     }
 
     private void SyncPauseText()

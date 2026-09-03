@@ -1,0 +1,17 @@
+{
+  "model_evaluated": "clawfile-agent:latest",
+  "benchmark_file": "C:\\Users\\shint\\Documents\\FolderVisionAI-FileID\\clawfile-training\\benchmarks\\frozen_test_benchmark.jsonl",
+  "total_test_samples": 35,
+  "file_tasks_count": 14,
+  "chat_tasks_count": 21,
+  "evaluation_time_seconds": 137.2,
+  "overall_benchmark_score": 97.14,
+  "category_accuracy": {
+    "FILE_ORGANIZING": 100.0,
+    "CONVERSATION": 95.24
+  },
+  "quality_indicators": {
+    "think_tag_compliance_pct": 100.0,
+    "safe_windows_filename_pct": 100.0
+  }
+}

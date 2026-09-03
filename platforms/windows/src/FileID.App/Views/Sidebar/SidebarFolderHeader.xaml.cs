@@ -1,4 +1,4 @@
-﻿// SidebarFolderHeader code-behind. Wires the picker / clear / wipe
+// SidebarFolderHeader code-behind. Wires the picker / clear / wipe
 // actions to the AppViewModel and EngineClient. The visibility of the
 // "actions" vs "empty picker" sections is driven by AppViewModel.HasFolder
 // changes.
@@ -220,7 +220,7 @@ public sealed partial class SidebarFolderHeader : UserControl
         // delete its live SQLite/WAL files from the UI as a fallback.
         await ShowAlertAsync(
             "Wipe failed safely",
-            "The background service could not clear the library. Nothing was deleted. Restart Folder Vision and try again.");
+            "The background service could not clear the library. Nothing was deleted. Restart ClawFile and try again.");
     }
 
     /// <summary>Final step of a wipe: reset the app to its first-run clean
