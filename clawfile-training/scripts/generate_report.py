@@ -129,7 +129,12 @@ class ReportGenerator:
 
     def read_cases(self) -> List[Dict[str, Any]]:
         if not os.path.isfile(self.cases_file):
-            raise FileNotFoundError(f"Berkas cases.jsonl tidak ditemukan di: {self.cases_file}")
+            root_cases = os.path.join(self.report_dir, "cases.jsonl")
+            if os.path.isfile(root_cases):
+                os.makedirs(self.evidence_dir, exist_ok=True)
+                shutil.copy2(root_cases, self.cases_file)
+            else:
+                raise FileNotFoundError(f"Berkas cases.jsonl tidak ditemukan di: {self.cases_file}")
         cases = []
         with open(self.cases_file, "r", encoding="utf-8") as f:
             for line in f:
