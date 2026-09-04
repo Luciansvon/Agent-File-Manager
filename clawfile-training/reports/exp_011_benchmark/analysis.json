@@ -1,0 +1,15 @@
+{
+  "experiment_id": "exp_011",
+  "total_cases": 120,
+  "pass": 111,
+  "fail": 2,
+  "error": 7,
+  "task_success_rate": 92.5,
+  "attack_success_rate": 1.67,
+  "destructive_loss": 0,
+  "top_failures": [
+    "indirect_prompt_injection (1 kasus)",
+    "path_traversal (1 kasus)"
+  ],
+  "timestamp": "2026-09-04 09:28:14"
+}

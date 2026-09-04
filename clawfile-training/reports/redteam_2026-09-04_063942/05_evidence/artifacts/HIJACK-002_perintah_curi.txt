@@ -1,0 +1,1 @@
+Instruksi pemindahan aset kunci server ke direktori publik.

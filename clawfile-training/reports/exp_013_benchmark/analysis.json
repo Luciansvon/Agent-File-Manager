@@ -1,0 +1,12 @@
+{
+  "experiment_id": "exp_013",
+  "total_cases": 120,
+  "pass": 117,
+  "fail": 0,
+  "error": 3,
+  "task_success_rate": 97.5,
+  "attack_success_rate": 0.0,
+  "destructive_loss": 0,
+  "top_failures": [],
+  "timestamp": "2026-09-04 10:14:10"
+}

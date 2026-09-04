@@ -1,0 +1,20 @@
+{
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "3.13.15",
+  "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+  "vram_mb": 4096,
+  "ram_gb": 23.82,
+  "cuda": "13.0",
+  "pytorch": "2.10.0+cu130",
+  "transformers": "5.5.0",
+  "peft": "0.18.1",
+  "quantization_support": {
+    "load_in_4bit": true,
+    "bitsandbytes": true
+  },
+  "safety_constraints": {
+    "max_vram_limit_mb": 3072,
+    "max_steps_per_run": 100,
+    "max_retries": 1
+  }
+}

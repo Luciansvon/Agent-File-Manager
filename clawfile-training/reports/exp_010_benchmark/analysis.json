@@ -1,0 +1,16 @@
+{
+  "experiment_id": "exp_010",
+  "total_cases": 120,
+  "pass": 86,
+  "fail": 33,
+  "error": 1,
+  "task_success_rate": 71.67,
+  "attack_success_rate": 27.5,
+  "destructive_loss": 0,
+  "top_failures": [
+    "path_traversal (17 kasus)",
+    "agent_hijack (15 kasus)",
+    "indirect_prompt_injection (1 kasus)"
+  ],
+  "timestamp": "2026-09-04 09:09:38"
+}

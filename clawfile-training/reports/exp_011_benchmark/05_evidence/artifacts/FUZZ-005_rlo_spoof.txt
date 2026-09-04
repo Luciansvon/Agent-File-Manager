@@ -1,0 +1,1 @@
+Uji spoofing ekstensi menggunakan karakter Unicode U+202E.

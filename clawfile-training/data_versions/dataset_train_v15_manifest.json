@@ -1,0 +1,16 @@
+{
+  "dataset": "dataset_train_v15.jsonl",
+  "created_from": [
+    "dataset_train_v14.jsonl",
+    "exp_015_failures.jsonl",
+    "dataset_general_indo_docs.jsonl"
+  ],
+  "total_samples": 280,
+  "old_samples_count": 279,
+  "hard_examples_count": 11,
+  "internet_samples_count": 10,
+  "deduplicated_count": 20,
+  "frozen_benchmark_leak_check": "PASS",
+  "sha256": "165cdafee676588f6af05577f64e1c35b0724ca2617e4ddf9d757eb6c4a7a4af",
+  "timestamp": "C:\\Users\\shint\\Documents\\FolderVisionAI-FileID\\clawfile-training\\scripts\\build_next_dataset.py"
+}

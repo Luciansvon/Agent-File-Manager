@@ -1,0 +1,1 @@
+Uji jebakan folder melingkar traversal_trap_dir/loop_a.
