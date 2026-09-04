@@ -1,7 +1,7 @@
-# Agent-File-Manager (Folder Vision AI)
+# ClawFile-Agent (Folder Vision AI)
 
 <p align="center">
-  <img src="shared/docs/assets/FileID-Logo.png" width="380" alt="Agent-File-Manager">
+  <img src="shared/docs/assets/ClawFile-Logo.png" width="380" alt="ClawFile-Agent">
 </p>
 
 <p align="center">
@@ -16,15 +16,9 @@
   <img src="https://img.shields.io/badge/100%25-on--device-green?style=flat-square">
 </p>
 
-<p align="center">
-  <a href="https://github.com/AdamNolle/FileID/actions/workflows/windows-engine.yml"><img src="https://github.com/AdamNolle/FileID/actions/workflows/windows-engine.yml/badge.svg" alt="Windows engine"></a>
-  <a href="https://github.com/AdamNolle/FileID/actions/workflows/windows-app.yml"><img src="https://github.com/AdamNolle/FileID/actions/workflows/windows-app.yml/badge.svg" alt="Windows app"></a>
-  <a href="https://github.com/AdamNolle/FileID/actions/workflows/macos.yml"><img src="https://github.com/AdamNolle/FileID/actions/workflows/macos.yml/badge.svg" alt="macOS app"></a>
-</p>
-
 ---
 
-Point FileID at a folder. It reads every file inside — images, video, PDFs, docs — and builds one searchable library that understands what's *in* them. Faces cluster into named cards. Duplicates group by perceptual hash. A local vision-language model writes captions and proposes filenames. Folder reorganization previews before anything moves on disk.
+Point ClawFile-Agent at a folder. It reads every file inside — images, video, PDFs, docs — and builds one searchable library that understands what's *in* them. Duplicates group by perceptual hash. A local vision-language model writes captions and proposes filenames. Folder reorganization previews before anything moves on disk.
 
 ---
 
