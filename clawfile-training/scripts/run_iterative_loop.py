@@ -123,6 +123,11 @@ def main():
             "--output", next_dataset_path
         ])
 
+        # 7. Pembersihan Berkas GGUF/LoRA Eksperimen Lama (Menjaga Disk Tetap Hemat)
+        clean_script = os.path.join(SCRIPTS_DIR, "clean_old_experiments.py")
+        if os.path.isfile(clean_script):
+            run_step([sys.executable, clean_script], allow_fail=True)
+
         print(f"\n[✓] SIKLUS {i+1} SELESAI! Dataset berikutnya tersimpan di {next_dataset_path}")
         
         current_version = next_version
