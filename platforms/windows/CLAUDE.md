@@ -43,11 +43,12 @@ platforms/windows/
 .\platforms\windows\build\publish-bundle.ps1 -SkipSign   # release MSIs + FileIDSetup.exe
 ```
 
-Self-verify headlessly (this is the dev-env loop): from `src/engine`, `cargo clippy --all-targets -- -D warnings` + `cargo test`; for the app, `dotnet build` / `dotnet test` / `dotnet format --verify-no-changes` on `FileID.sln`. On-hardware: `build\iterate.ps1 -Corpus <path>` drives a full scan + cluster + assertions against the RTX 2060 / `G:\TrueNAS`.
+Self-verify headlessly (this is the dev-env loop): from `src/engine`, `cargo clippy --all-targets -- -D warnings` + `cargo test`; for the app, `dotnet build` / `dotnet test` / `dotnet format --verify-no-changes` on `FileID.sln`. On-hardware: `build\iterate.ps1 -Corpus <path>` drives a full scan + cluster + assertions against the current NVIDIA GeForce RTX 3050 Laptop GPU (4 GB dedicated VRAM) / `G:\TrueNAS`.
 
 ## Current status
 
-Engine and app are both feature-complete across the six tabs. The commercial-clean / Apache-2.0 model stack is merged to `main` and CI-green, on-hardware verified (RTX 2060, DirectML):
+**Current hardware profile:** NVIDIA GeForce RTX 3050 Laptop GPU with 4 GB dedicated VRAM. Older RTX 2060 measurements are historical; new on-hardware validation and benchmark decisions must use this current laptop profile.
+Engine and app are both feature-complete across the six tabs. The commercial-clean / Apache-2.0 model stack is merged to `main` and CI-green. Historical on-hardware evidence used an RTX 2060; current hardware validation must target the NVIDIA GeForce RTX 3050 Laptop GPU (4 GB dedicated VRAM):
 - **Tagging:** RAM++ (Swin-L @384, 4585-tag ONNX) primary, per-class thresholds + generic-tag suppress-list; CLIP zero-shot scene tags are the fallback.
 - **Search:** CLIP ViT-B/32 (512-d image + text).
 - **Faces:** YuNet detect + SFace embed (128-d) + 5-point alignment; density clustering.
