@@ -38,8 +38,9 @@ Read the one for the work in front of you:
 
 ## How we work
 
+**Current hardware profile:** NVIDIA GeForce RTX 3050 Laptop GPU with 4 GB dedicated VRAM. Older RTX 2060 references below are historical and must not be used as the current benchmark target.
 - **Verify, don't assume.** The Windows engine + app compile, lint, and test headlessly in the dev env — self-verify every change (`cargo clippy --all-targets -D warnings`, `cargo test`; `dotnet build`/`test`/`format --verify-no-changes`). `cargo check` passing is not proof of correctness; the WinUI runtime/GPU path and all macOS Swift need the user's hardware.
-- **On-hardware checks** run on the dev RTX 2060 against the `G:\TrueNAS` corpus via `platforms/windows/build/iterate.ps1` (+ `scan_assertions.py`). Tune ML thresholds against real data, not by guess.
+- **On-hardware checks** run on the current dev NVIDIA GeForce RTX 3050 Laptop GPU with 4 GB dedicated VRAM against the `G:\TrueNAS` corpus via `platforms/windows/build/iterate.ps1` (+ `scan_assertions.py`). Tune ML thresholds against real data, not by guess. Older RTX 2060 measurements in historical reports are not the current target profile.
 - **Land work on a branch, then merge to `main` and confirm GitHub CI is green** (engine + app workflows). Commit/push when asked.
 - **Keep the record current:** newest entry on top of `STATE.md`; update `NEXT.md`; append non-obvious calls to `DECISIONS.md`.
 - Preserve the user's signature touches: `LavaLampBackground` (and its Win2D port), the gold palette, springs-everywhere motion.
